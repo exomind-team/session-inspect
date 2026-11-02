@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.token
+*.jsonl
+conversations.json
+rescued_*.json
+chatgpt*.json
