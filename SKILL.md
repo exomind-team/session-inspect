@@ -25,7 +25,8 @@ One entry point for session discovery and detailed inspection. Use bundled scrip
 | `session-extract --merge ...` | `session_inspect.py merge ...` |
 | `session-extract --as openai ...` | `session_inspect.py convert ...` (existing product) or `handoff --as openai` (new extraction) |
 
-The predecessor GitHub repositories are archived. This skill is the only supported entry point.
+The predecessor GitHub repositories are archived and read-only. The public successor is
+<https://github.com/exomind-team/session-inspect>; this skill is the only supported entry point.
 
 ## Entry point
 
