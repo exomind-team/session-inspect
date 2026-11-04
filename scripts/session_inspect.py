@@ -11,17 +11,18 @@ if SCRIPT_DIR not in sys.path:
 
 import session_extract
 import session_review
+import to_openai
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HELP = f"""session-inspect {VERSION}
 
 Usage:
-  python session_inspect.py overview [session-review options]
+  python session_inspect.py overview [options]
   python session_inspect.py find --scan <conversations.json> --kw <term> [--kw <term> ...]
-  python session_inspect.py read [session-extract options]
-  python session_inspect.py merge [session-extract --merge options]
-  python session_inspect.py handoff [session-extract options]
-  python session_inspect.py convert [session-extract --as openai options]
+  python session_inspect.py read [options]
+  python session_inspect.py merge --merge <export.json> --merge-with <share.json> [options]
+  python session_inspect.py handoff [options] --out <product.json>
+  python session_inspect.py convert <product.json> [--out <chatgpt.json>]
 
 Modes:
   overview  Local Codex / Claude Code radar
@@ -31,15 +32,55 @@ Modes:
   handoff   Create a sourced extraction product
   convert   Convert an extraction product for ChatGPT/OpenAI
 
-Use '<mode> --help' for overview options, or consult SKILL.md for extraction examples.
+Run '<mode> --help' for mode-specific options.
 """
 MODE_HELP = {
-    "find": "Use: session_inspect.py find --scan <conversations.json> --kw <term> [--kw <term> ...]",
-    "read": "Use: session_inspect.py read [session-extract options]. See session-extract usage in SKILL.md.",
-    "merge": "Use: session_inspect.py merge --merge <export.json> --merge-with <share.json> --out <result.json>.",
-    "handoff": "Use: session_inspect.py handoff [session-extract options] and set an explicit output path when writing a file.",
-    "convert": "Use: session_inspect.py convert <product.json> [--out <chatgpt.json>].",
+    "find": "Usage: session_inspect.py find --scan <conversations.json> --kw <term> [--kw <term> ...] [--top N] [--json]",
+    "read": "Usage: session_inspect.py read [source] [options]",
+    "merge": "Usage: session_inspect.py merge --merge <export.json> --merge-with <share.json> [--out <result.json> | --outdir <dir>] [--markdown]",
+    "handoff": "Usage: session_inspect.py handoff [source] --out <product.json> [--as rescued|openai] [--verify]",
+    "convert": "Usage: session_inspect.py convert <product.json> [--out <chatgpt.json>] [--slim] [--strict] [--stats]",
 }
+
+EXTRACT_OPTIONS_HELP = """Source options:
+  --session <id>                 Locate a local Codex/Claude Code session by ID
+  --summary <file>               Print only a work summary
+  --platform codex|claude|deepseek|deepseek-share
+  --ids <id>[,<id>]              DeepSeek export conversation IDs/prefixes
+  --all                          Export every DeepSeek conversation
+  --scan <conversations.json>    DeepSeek corpus search (use with --kw)
+  --kw <term>                    Corpus keyword; repeatable
+  --top <N>                      Corpus search result limit
+
+Output options:
+  --out <file>                   Single output file
+  --outdir <dir>                 One product per conversation
+  --as rescued|openai            Product shape (default: rescued)
+  --title <name>                 Real title for DeepSeek share links
+  --reason <text>                Rescue reason recorded in metadata
+  --markdown                     Also write a Markdown preview
+  --verify                       Multiset verification (no loss/duplication)
+  --json                         Machine-readable output where supported
+
+Merge options:
+  --merge <export.json>          DeepSeek export-package product
+  --merge-with <share.json>      DeepSeek share-link product
+
+Run with an explicit source and output path when writing files."""
+
+
+def _extract_main(rest):
+    result = session_extract.main(rest)
+    return result if isinstance(result, int) else 0
+
+
+def _print_extract_help(mode):
+    print(MODE_HELP[mode])
+    if mode != "find":
+        print()
+        print(EXTRACT_OPTIONS_HELP)
+    else:
+        print("Repeats --kw; ranking favors title matches and rare terms.")
 
 
 def main(argv=None):
@@ -56,21 +97,24 @@ def main(argv=None):
         return session_review.main(rest)
     if mode == "find":
         if rest in (["-h"], ["--help"]):
-            print(MODE_HELP[mode])
+            _print_extract_help(mode)
             return 0
         if "--scan" not in rest:
             print(MODE_HELP[mode], file=sys.stderr)
             return 2
-        result = session_extract.main(rest)
-        return result if isinstance(result, int) else 0
-    if mode in ("read", "extract", "merge", "handoff", "convert"):
+        return _extract_main(rest)
+    if mode in ("read", "extract", "merge", "handoff"):
         if rest in (["-h"], ["--help"]):
-            print(MODE_HELP["read" if mode == "extract" else mode])
+            _print_extract_help("read" if mode == "extract" else mode)
             return 0
-        if mode == "convert" and "--as" not in rest:
-            rest = [*rest, "--as", "openai"]
-        result = session_extract.main(rest)
-        return result if isinstance(result, int) else 0
+        return _extract_main(rest)
+    if mode == "convert":
+        if rest in (["-h"], ["--help"]):
+            print(MODE_HELP[mode])
+            print()
+            print("Converts an existing rescued-session/v1 product; use handoff --as openai for a new extraction.")
+            return 0
+        return to_openai.main(rest)
 
     print(f"Unknown mode: {mode}", file=sys.stderr)
     print(HELP, file=sys.stderr)

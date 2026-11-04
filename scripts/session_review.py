@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unified Session Review — Codex + Claude Code session radar.
+Session overview — Codex + Claude Code session radar.
 
 Default behavior scans both platforms. --platform narrows the result set.
 """
@@ -189,9 +189,9 @@ def print_markdown(records, *, platform, days, session_id=None, group_by="thread
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d") if days > 0 else "全部"
     scope = "Codex + Claude Code" if platform == "all" else platform
     if session_id:
-        print(f"=== Session Review: {session_id} ({scope}) ===")
+        print(f"=== Session Inspect Overview: {session_id} ({scope}) ===")
     else:
-        print(f"=== Session Review ({scope}, {start} ~ {now.strftime('%Y-%m-%d')}) ===")
+        print(f"=== Session Inspect Overview ({scope}, {start} ~ {now.strftime('%Y-%m-%d')}) ===")
     print(f"=== 共 {len(records)} 条记录，视图: {group_by} ===\n")
     if not records:
         print("未找到匹配会话。")
@@ -228,9 +228,9 @@ def print_detail(records, *, platform, days, session_id=None, group_by="thread")
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d") if days > 0 else "全部"
     scope = "Codex + Claude Code" if platform == "all" else platform
     if session_id:
-        print(f"=== Session Review Detail: {session_id} ({scope}) ===")
+        print(f"=== Session Inspect Overview Detail: {session_id} ({scope}) ===")
     else:
-        print(f"=== Session Review Detail ({scope}, {start} ~ {now.strftime('%Y-%m-%d')}) ===")
+        print(f"=== Session Inspect Overview Detail ({scope}, {start} ~ {now.strftime('%Y-%m-%d')}) ===")
     print(f"=== 共 {len(records)} 条记录，视图: {group_by} ===\n")
     if not records:
         print("未找到匹配会话。")
@@ -492,7 +492,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.version:
-        print(f"session-review {SCRIPT_VERSION}")
+        print(f"session-inspect overview {SCRIPT_VERSION}")
         return 0
 
     session_id = args.session or args.uuid

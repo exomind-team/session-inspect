@@ -1,5 +1,5 @@
 """
-Claude Code session scanner for unified session-review.
+Claude Code session scanner for session-inspect overview.
 
 Preserves the original project-oriented aggregation while exposing the same
 record shape as the Codex adapter.

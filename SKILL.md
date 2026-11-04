@@ -6,12 +6,26 @@ description: |
   bundles and share links. Use when finding prior work, reviewing session
   history, recovering context, or packaging a sourced handoff.
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # Session Inspect
 
 One entry point for session discovery and detailed inspection. Use bundled scripts; do not write one-off parsers for supported sources.
+
+## Supersedes
+
+`session-review` and `session-extract` are retired. Do not invoke them or rely on their installed directories. Their behavior is available through this skill:
+
+| Retired entry | Use instead |
+|---|---|
+| `session-review ...` | `session_inspect.py overview ...` |
+| `session-extract ...` | `session_inspect.py read ...` |
+| `session-extract --scan ...` | `session_inspect.py find ...` |
+| `session-extract --merge ...` | `session_inspect.py merge ...` |
+| `session-extract --as openai ...` | `session_inspect.py convert ...` (existing product) or `handoff --as openai` (new extraction) |
+
+The predecessor GitHub repositories are archived. This skill is the only supported entry point.
 
 ## Entry point
 
@@ -23,9 +37,9 @@ python "<skill-dir>/scripts/session_inspect.py" <mode> [arguments]
 
 Modes:
 
-- `overview`: quick local overview and filters for Codex and Claude Code. Accepts the former `session-review` options.
+- `overview`: quick local overview and filters for Codex and Claude Code. Run `overview --help` for scan options.
 - `find`: use `--scan <conversations.json> --kw <term>` (repeat `--kw`) to find DeepSeek export-package conversations across the corpus.
-- `read`: inspect a known session or source file using the former `session-extract` options.
+- `read`: inspect a known session or source file. Run `read --help` for source and extraction options.
 - `merge`: combine DeepSeek export-package and share-link products with source provenance.
 - `handoff`: extract a selected conversation and choose an output format/path explicitly.
 - `convert`: convert an existing product to ChatGPT/OpenAI messages.

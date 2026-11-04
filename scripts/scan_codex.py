@@ -1,5 +1,5 @@
 """
-Codex session scanner for unified session-review.
+Codex session scanner for session-inspect overview.
 
 Scans ~/.codex/sessions and ~/.codex/archived_sessions, groups rollout JSONL
 files by thread id, and only reads safe/structured fields.

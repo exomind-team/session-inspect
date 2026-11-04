@@ -1,5 +1,5 @@
 """
-Shared helpers for the unified session-review scripts.
+Shared helpers for the session-inspect overview scripts.
 
 The helpers keep display, filtering, and summary rules identical across
 Codex and Claude Code adapters.
