@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Session overview — Codex + Claude Code session radar.
+Session overview — Codex, Claude Code, and T3Code thread radar.
 
-Default behavior scans both platforms. --platform narrows the result set.
+Default behavior scans all local sources. --platform narrows the result set.
 """
 import argparse
 import json
@@ -13,19 +13,26 @@ from datetime import datetime, timedelta
 
 import scan_claude
 import scan_codex
+import scan_t3
 from scan_common import dump_json, make_record, public_record, sanitize_cell, short_cwd
 
 
-SCRIPT_VERSION = "0.6.0"
+SCRIPT_VERSION = "0.7.0"
 DEFAULT_ACTION_LIMIT = 12
 
 
-def scan_all(platform="all", days=7, project=None, grep=None, session_id=None, group_by="thread"):
+def scan_all(platform="all", days=7, project=None, grep=None, session_id=None,
+             group_by="thread", home=None, t3_db=None):
     records = []
     if platform in ("all", "codex"):
-        records.extend(scan_codex.scan(days=days, project=project, grep=grep, session_id=session_id))
+        records.extend(scan_codex.scan(days=days, project=project, grep=grep,
+                                       session_id=session_id, home=home))
     if platform in ("all", "claude"):
-        records.extend(scan_claude.scan(days=days, project=project, grep=grep, session_id=session_id))
+        records.extend(scan_claude.scan(days=days, project=project, grep=grep,
+                                        session_id=session_id, home=home))
+    if platform in ("all", "t3"):
+        records.extend(scan_t3.scan(days=days, project=project, grep=grep,
+                                    session_id=session_id, home=home, db_path=t3_db))
     records.sort(key=lambda r: r["last_active_ts"], reverse=True)
     annotate_action_fields(records)
     if group_by == "cwd" and not session_id:
@@ -85,7 +92,14 @@ def annotate_action_fields(records):
         record["completion_state"] = state
         record["action_score"] = score
         record["action_reasons"] = reasons
-        record["next_action_hint"] = next_action_hint(record, state)
+        if record.get("platform") == "t3":
+            record["next_action_hint"] = (
+                "Read with session-inspect read --platform t3 --session "
+                + str(record.get("context_uri") or record.get("id") or "")
+                + "; resume only in the T3Code app."
+            )
+        else:
+            record["next_action_hint"] = next_action_hint(record, state)
 
 
 def infer_action_state(record):
@@ -187,7 +201,7 @@ def next_action_hint(record, state):
 def print_markdown(records, *, platform, days, session_id=None, group_by="thread"):
     now = datetime.now()
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d") if days > 0 else "全部"
-    scope = "Codex + Claude Code" if platform == "all" else platform
+    scope = "Codex + Claude Code + T3Code" if platform == "all" else platform
     if session_id:
         print(f"=== Session Inspect Overview: {session_id} ({scope}) ===")
     else:
@@ -226,7 +240,7 @@ def print_markdown(records, *, platform, days, session_id=None, group_by="thread
 def print_detail(records, *, platform, days, session_id=None, group_by="thread"):
     now = datetime.now()
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d") if days > 0 else "全部"
-    scope = "Codex + Claude Code" if platform == "all" else platform
+    scope = "Codex + Claude Code + T3Code" if platform == "all" else platform
     if session_id:
         print(f"=== Session Inspect Overview Detail: {session_id} ({scope}) ===")
     else:
@@ -323,7 +337,7 @@ def print_restore_view(records, *, platform, days, shell, limit, codex_cli, clau
 def print_action_header(title, platform, days, total_count, selected_count):
     now = datetime.now()
     start = (now - timedelta(days=days)).strftime("%Y-%m-%d") if days > 0 else "全部"
-    scope = "Codex + Claude Code" if platform == "all" else platform
+    scope = "Codex + Claude Code + T3Code" if platform == "all" else platform
     print(f"=== {title} ({scope}, {start} ~ {now.strftime('%Y-%m-%d')}) ===")
     print(f"=== 候选 {selected_count} / 扫描 {total_count} 条 ===\n")
 
@@ -345,8 +359,9 @@ def print_action_item(idx, record, shell, codex_cli, claude_cli):
 
 
 def select_action_records(records, limit):
+    resumable = [record for record in records if record.get("platform") in ("codex", "claude")]
     ranked = sorted(
-        records,
+        resumable,
         key=lambda r: (r.get("action_score", 0), r.get("last_active_ts", 0)),
         reverse=True,
     )
@@ -463,11 +478,13 @@ def build_focus_sections(records):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Scan Codex and Claude Code sessions")
-    parser.add_argument("--platform", choices=["all", "codex", "claude"], default="all",
+    parser = argparse.ArgumentParser(description="Scan Codex, Claude Code, and T3Code sessions")
+    parser.add_argument("--platform", choices=["all", "codex", "claude", "t3"], default="all",
                         help="Filter platform; default scans all platforms")
     parser.add_argument("--days", type=int, default=7, help="Scan recent N days; 0 means all")
-    parser.add_argument("--session", help="Cross-platform session/thread UUID lookup")
+    parser.add_argument("--session", help="Native session ID or exact T3 context/thread reference")
+    parser.add_argument("--home", help="Override the local agent data home")
+    parser.add_argument("--t3-db", help="Override the read-only T3 statev2.sqlite path")
     parser.add_argument("--uuid", help="Alias for --session")
     parser.add_argument("--project", help="Filter by title/display_name/cwd/id")
     parser.add_argument("--grep", help="Filter by readable user/agent text")
@@ -504,6 +521,8 @@ def main(argv=None):
         grep=args.grep,
         session_id=session_id,
         group_by=group_by,
+        home=args.home,
+        t3_db=args.t3_db,
     )
     if args.json:
         dump_json(records)

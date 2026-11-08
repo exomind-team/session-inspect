@@ -1,6 +1,6 @@
 # session-inspect
 
-Unified entry point for exploring and inspecting Codex, Claude Code, and DeepSeek conversation histories.
+Unified entry point for T3Code thread entry, native Codex and Claude Code sessions, and DeepSeek conversation histories.
 
 Public repository: <https://github.com/exomind-team/session-inspect>
 
@@ -11,7 +11,7 @@ This repository supersedes two retired, archived skills:
 
 The Agent-facing contract is in `SKILL.md`. Invoke the bundled dispatcher at `scripts/session_inspect.py`; it routes overview work to the review modules and targeted extraction/DeepSeek workflows to the extraction modules. The former scripts are bundled as internal modules, not separate entry points.
 
-This repository intentionally uses no persistent index or database. Original session files are read-only; exports should be written to an explicit destination outside this repository.
+This repository creates no persistent index or database of its own. Original sessions and the existing T3 state database are read-only; exports should be written to an explicit destination outside this repository.
 
 ## Install
 
@@ -30,6 +30,8 @@ python scripts/session_inspect.py overview --days 7
 python scripts/session_inspect.py overview --session <uuid> --json
 python scripts/session_inspect.py find --scan <conversations.json> --kw <topic>
 python scripts/session_inspect.py read --session <uuid>
+python scripts/session_inspect.py read --platform t3 --session "t3-context://v1/thread/thread_<uuid>"
+python scripts/session_inspect.py read --platform t3 --session "t3-context://v1/thread/thread_<uuid>" --out <out.json>
 python scripts/session_inspect.py read --platform deepseek-share <share-url> --outdir <dir> --verify
 python scripts/session_inspect.py convert <product.json> --out <chatgpt.json>
 ```

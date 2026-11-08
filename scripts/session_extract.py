@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Unified Session Extractor — 支持 Codex、Claude Code 和 DeepSeek 三种会话格式。
+Unified Session Extractor — 支持 Codex、Claude Code、T3Code 和 DeepSeek 会话入口。
 
 自动检测平台，单次遍历提取上下文。
 
 用法：
-    python session_extract.py --session <session-id>
+    python session_extract.py --session <session-id|t3-context-uri>
     python session_extract.py <session.jsonl>
     python session_extract.py --summary <session.jsonl>
     python session_extract.py --platform codex|claude <file>
+    python session_extract.py --platform t3 --session <t3-context-uri>
+    python session_extract.py --platform t3 --session <t3-context-uri> --out <product.json>
     python session_extract.py --platform deepseek <conversations.json> --ids <id>[,<id>] --out <out.json>
     python session_extract.py --platform deepseek <conversations.json> --ids <id>[,<id>] --outdir <dir>
     python session_extract.py --platform deepseek-share <share_id|share_url> --outdir <dir>
@@ -29,6 +31,7 @@ from extract_claude import extract as extract_claude
 import extract_deepseek
 import extract_deepseek_share
 import merge_deepseek
+import t3code
 
 
 # ============================================================
@@ -139,7 +142,7 @@ def extract(filepath, platform=None):
         # 用户会拿到一份**全是 N/A 的假报告**而且 exit 0 —— 比崩溃更伤信任。
         raise ValueError(
             "无法识别会话格式（platform=unknown）。"
-            "请用 --platform 显式指定：codex / claude / deepseek。"
+            "请用 --platform 显式指定：codex / claude / t3 / deepseek。"
             "（若这是 Claude Code 会话，常见原因是文件头几行是旁路记录，"
             "现在会自动往后扫 2000 行，但仍认不出时请手动指定。）"
         )
@@ -615,13 +618,18 @@ def run_deepseek_extract(filepath, ids, extract_all, out, outdir, reason, markdo
 
 USAGE = """Usage:
   python session_extract.py <session.jsonl>
-  python session_extract.py --session <session-id>
+  python session_extract.py --session <session-id|t3-context-uri>
   python session_extract.py --summary <session.jsonl>
   python session_extract.py --platform codex|claude <file>
+  python session_extract.py --platform t3 --session <t3-context-uri>
+  python session_extract.py --platform t3 --session <t3-context-uri> --out <product.json>
   python session_extract.py --platform deepseek <conversations.json> --ids <id>[,<id>] [--out <out.json> | --outdir <dir>]
   python session_extract.py --platform deepseek-share <share_id|share_url> [--out <out.json> | --outdir <dir>]
   python session_extract.py --merge <export-product.json> --merge-with <share-product.json> [--outdir <dir>]
   python session_extract.py --scan <conversations.json> --kw <keyword> [--kw <keyword>...] [--top N]
+
+  --t3-db <file>  T3 状态库路径覆盖（只读）
+  --home <dir>    覆盖本地 Agent 数据根目录
 
 Output shape:
   --as rescued   rescued-session/v1（默认，忠实产物）
@@ -645,6 +653,8 @@ def main(argv=None):
     filepath = None
     platform = None
     home = None
+    t3_db = None
+    session_ref = None
 
     # --- 新增（DeepSeek 相关）---
     scan_file = None
@@ -666,22 +676,16 @@ def main(argv=None):
     i = 0
     while i < len(args):
         if args[i] == "--session" and i + 1 < len(args):
-            session_id = args[i + 1]
+            session_ref = args[i + 1]
             i += 2
-            detected_platform, detected_path = find_session(session_id, home)
-            if not detected_path:
-                print(f"ERROR: Cannot find session file for ID {session_id}")
-                print("  Searched: ~/.codex/sessions/ and ~/.claude/projects/")
-                sys.exit(1)
-            platform = detected_platform
-            filepath = detected_path
-            print(f"Found [{platform}]: {filepath}")
-            print()
         elif args[i] == "--platform" and i + 1 < len(args):
             platform = args[i + 1].lower()
             i += 2
         elif args[i] == "--home" and i + 1 < len(args):
             home = args[i + 1]
+            i += 2
+        elif args[i] == "--t3-db" and i + 1 < len(args):
+            t3_db = args[i + 1]
             i += 2
         elif args[i] == "--summary" and i + 1 < len(args):
             mode = "summary"
@@ -741,6 +745,67 @@ def main(argv=None):
         else:
             filepath = args[i]
             i += 1
+
+    # --- T3Code entry: resolve the app thread, then reuse native harness parsers ---
+    t3_reference = session_ref or filepath
+    is_t3_reference = (
+        platform == "t3"
+        or (isinstance(t3_reference, str)
+            and (t3_reference.startswith("t3-context://")
+                 or t3_reference.startswith("thread_")))
+    )
+    if is_t3_reference:
+        if not t3_reference:
+            print("ERROR: --platform t3 requires --session <T3 thread reference>")
+            return 2
+        if as_shape != "rescued":
+            print("ERROR: T3 thread products use the T3 provenance schema; --as openai is not supported.")
+            return 2
+        try:
+            product = t3code.extract_thread(
+                t3_reference, home=home, db_path=t3_db, include_harness=True)
+        except (t3code.T3Error, OSError, ValueError) as exc:
+            print("ERROR: " + str(exc), file=sys.stderr)
+            return 1
+        if verify:
+            product["verification"] = t3code.verify_product(product)
+            if not product["verification"]["ok"]:
+                print(json.dumps(product["verification"], ensure_ascii=False, indent=2))
+                return 3
+        if out:
+            out_parent = os.path.dirname(os.path.abspath(out))
+            os.makedirs(out_parent, exist_ok=True)
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(product, f, ensure_ascii=False, indent=2, default=str)
+        if markdown:
+            if not out:
+                print("ERROR: --markdown for T3 requires --out <product.json>")
+                return 2
+            md_path = os.path.splitext(out)[0] + ".md"
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(t3code.render_markdown(product))
+        if as_json and not out:
+            print(json.dumps(product, ensure_ascii=False, indent=2, default=str))
+        else:
+            print(t3code.summary_text(product))
+            if out:
+                print("\nWrote: " + os.path.abspath(out))
+                if markdown:
+                    print("Markdown: " + os.path.abspath(os.path.splitext(out)[0] + ".md"))
+        return 0
+
+    # Resolve native Codex / Claude IDs only after all options are parsed.
+    if session_ref:
+        detected_platform, detected_path = find_session(session_ref, home)
+        if not detected_path:
+            print(f"ERROR: Cannot find native session file for ID {session_ref}")
+            print("  Searched: ~/.codex/sessions/ and ~/.claude/projects/")
+            print("  For T3 links, use --platform t3 or t3-context://v1/thread/<id>.")
+            return 1
+        platform = platform or detected_platform
+        filepath = detected_path
+        print(f"Found [{platform}]: {filepath}")
+        print()
 
     # --- 语料库检索模式（DeepSeek 导出包）---
     if scan_file:

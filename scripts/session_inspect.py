@@ -13,7 +13,7 @@ import session_extract
 import session_review
 import to_openai
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HELP = f"""session-inspect {VERSION}
 
 Usage:
@@ -25,7 +25,7 @@ Usage:
   python session_inspect.py convert <product.json> [--out <chatgpt.json>]
 
 Modes:
-  overview  Local Codex / Claude Code radar
+  overview  Local Codex / Claude Code / T3Code radar
   find      DeepSeek export-package corpus search
   read      Inspect a selected session or source file
   merge     Merge DeepSeek export and share-link products
@@ -43,14 +43,16 @@ MODE_HELP = {
 }
 
 EXTRACT_OPTIONS_HELP = """Source options:
-  --session <id>                 Locate a local Codex/Claude Code session by ID
+  --session <id>                 Locate a local session or exact T3 thread reference
   --summary <file>               Print only a work summary
-  --platform codex|claude|deepseek|deepseek-share
+  --platform codex|claude|t3|deepseek|deepseek-share
   --ids <id>[,<id>]              DeepSeek export conversation IDs/prefixes
   --all                          Export every DeepSeek conversation
   --scan <conversations.json>    DeepSeek corpus search (use with --kw)
   --kw <term>                    Corpus keyword; repeatable
   --top <N>                      Corpus search result limit
+  --home <dir>                   Override local agent data home
+  --t3-db <file>                 Override the read-only T3 statev2.sqlite path
 
 Output options:
   --out <file>                   Single output file
