@@ -13,7 +13,7 @@ import session_extract
 import session_review
 import to_openai
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HELP = f"""session-inspect {VERSION}
 
 Usage:
@@ -61,18 +61,19 @@ Output options:
   --title <name>                 Real title for DeepSeek share links
   --reason <text>                Rescue reason recorded in metadata
   --markdown                     Also write a Markdown preview
-  --verify                       Multiset verification (no loss/duplication)
-  --json                         Machine-readable output where supported
+  --verify                       Verification receipt for the declared scope
+  --json                         Machine-readable stdout; diagnostics go to stderr
 
 Merge options:
   --merge <export.json>          DeepSeek export-package product
   --merge-with <share.json>      DeepSeek share-link product
 
-Run with an explicit source and output path when writing files."""
+Native codex/claude `handoff` requires --out and writes atomically.
+`read --out` saves the same product it prints. T3/DeepSeek keep their own writers."""
 
 
-def _extract_main(rest):
-    result = session_extract.main(rest)
+def _extract_main(rest, mode="read"):
+    result = session_extract.main(rest, entry_mode=mode)
     return result if isinstance(result, int) else 0
 
 
@@ -109,7 +110,7 @@ def main(argv=None):
         if rest in (["-h"], ["--help"]):
             _print_extract_help("read" if mode == "extract" else mode)
             return 0
-        return _extract_main(rest)
+        return _extract_main(rest, mode=mode)
     if mode == "convert":
         if rest in (["-h"], ["--help"]):
             print(MODE_HELP[mode])

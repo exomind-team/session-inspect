@@ -19,46 +19,51 @@ Unified Session Extractor — 支持 Codex、Claude Code、T3Code 和 DeepSeek �
 import json
 import os
 import sys
-import glob
 
 # 脚本同目录的兄弟模块（extract_codex / extract_claude / extract_deepseek）。
 # 用 `python -I`（隔离模式）运行时，解释器不会把脚本目录放进 sys.path，
 # 这里显式补上，否则 `from extract_codex import ...` 会 ModuleNotFoundError。
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from extract_codex import extract as extract_codex
+import extract_codex
+from extract_codex import extract as extract_codex_file
 from extract_claude import extract as extract_claude
 import extract_deepseek
 import extract_deepseek_share
 import merge_deepseek
 import t3code
+import scan_codex
 
 
 # ============================================================
 # Platform Detection
 # ============================================================
 
-def find_session(session_id, home=None):
-    """在 Codex 和 Claude Code 两个目录中搜索 session ID。"""
+def find_session(session_id, home=None, platform=None):
+    """Resolve a native session ID to every matching source file.
+
+    Codex identity is taken from session_meta, never from a filename. A
+    filename is only a hint used to skip files cheaply, so unrelated names
+    still resolve. All primary rollouts of the same thread are returned.
+    """
     if home is None:
         home = os.path.expanduser("~")
 
-    for pattern in [
-        os.path.join(home, ".codex", "sessions", "**", "*.jsonl"),
-        os.path.join(home, ".codex", "archived_sessions", "*.jsonl"),
-    ]:
-        for f in glob.glob(pattern, recursive=True):
-            if session_id in os.path.basename(f):
-                return ("codex", f)
+    if platform in (None, "codex", "all"):
+        codex_files = scan_codex.find_session_files(
+            session_id, platform="codex", home=home)
+        if codex_files:
+            return ("codex", [str(path) for path in codex_files])
 
-    for pattern in [
-        os.path.join(home, ".claude", "projects", "**", "*.jsonl"),
-    ]:
-        for f in glob.glob(pattern, recursive=True):
-            if session_id in os.path.basename(f):
-                return ("claude", f)
+    if platform in (None, "claude", "all"):
+        import scan_claude
 
-    return (None, None)
+        claude_files = scan_claude.find_session_files(
+            session_id, platform="claude", home=home)
+        if claude_files:
+            return ("claude", [str(path) for path in claude_files])
+
+    return (None, [])
 
 
 def detect_platform(filepath, scan_lines=2000):
@@ -132,7 +137,7 @@ def extract(filepath, platform=None):
         platform = detect_platform(filepath)
 
     if platform == "codex":
-        return extract_codex(filepath)
+        return extract_codex_file(filepath)
     elif platform == "claude":
         return extract_claude(filepath)
     elif platform == "deepseek":
@@ -373,6 +378,163 @@ def _write_json(path, obj):
     """统一按 UTF-8 + 不转义中文写 JSON。"""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def _write_json_atomic(path, obj):
+    """Write a product atomically so a failure cannot clobber a good version."""
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    temp = target + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, target)
+    return target
+
+
+def _sha256_path(path):
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _native_view(result, platform):
+    """Project a native parser result into a stable machine-readable view."""
+    view = {
+        "platform": platform,
+        "session_info": result.get("session_info") or {},
+        "session_title": result.get("session_title") or "",
+    }
+    if platform == "codex":
+        view["coverage"] = result.get("coverage") or {}
+        view["sources"] = [
+            {
+                "file": source.get("path"),
+                "sha256": source.get("sha256"),
+                "bytes": source.get("bytes"),
+                "decoder": source.get("decoder"),
+            }
+            for source in (result.get("sources") or [])
+        ]
+    view.update({
+        "user_msgs": result.get("user_msgs") or [],
+        "agent_texts": result.get("agent_texts") or [],
+        "tool_uses": result.get("tool_uses") or [],
+        "tool_use_counts": dict(result.get("tool_use_counts") or {}),
+        "file_changes": result.get("file_changes") or [],
+        "system_events": result.get("system_events") or [],
+        "queue_ops": result.get("queue_ops") or [],
+        "compacted_summaries": result.get("compacted_summaries") or [],
+        "totals": {
+            "user_msgs": result.get("total_user_msgs", 0),
+            "agent_msgs": result.get("total_agent_msgs", 0),
+            "tool_results": result.get("total_tool_results", 0),
+            "api_errors": result.get("api_errors", 0),
+            "turn_aborted": result.get("turn_aborted", 0),
+        },
+    })
+    return view
+
+
+def _native_verification(result, platform):
+    """Return an explicit verification object, never a silent pass."""
+    if platform == "codex":
+        sources = result.get("sources") or []
+        return {
+            "ok": bool(sources) and all(source.get("readable") for source in sources),
+            "scope": "native Codex sources parsed; declared coverage only",
+            "checks": {
+                "source_files_readable": bool(sources) and all(
+                    source.get("readable") for source in sources),
+                "source_hashes_present": bool(sources) and all(
+                    source.get("sha256") for source in sources),
+                "coverage_declared": bool(result.get("coverage")),
+            },
+            "coverage": result.get("coverage") or {},
+        }
+    if platform == "claude":
+        return {
+            "ok": True,
+            "scope": "native Claude parser result; source file hash not checked",
+            "checks": {"parsed_content_present": bool(
+                result.get("user_msgs") or result.get("agent_texts"))},
+            "coverage": result.get("coverage") or {},
+        }
+    return {
+        "ok": False,
+        "scope": "verification unsupported for platform {}".format(platform),
+    }
+
+
+def _claude_product(result, *, session_id, reason=None):
+    """Build a rescued-session/v1-shaped product for a native Claude session."""
+    transcript = []
+    ordinal = 0
+    for message in result.get("user_msgs") or []:
+        ordinal += 1
+        transcript.append({
+            "node_id": "n{}".format(ordinal),
+            "type": "REQUEST",
+            "content": message.get("text", ""),
+            "timestamp": message.get("timestamp", ""),
+        })
+    for message in result.get("agent_texts") or []:
+        ordinal += 1
+        transcript.append({
+            "node_id": "n{}".format(ordinal),
+            "type": "RESPONSE",
+            "content": message.get("text", ""),
+            "timestamp": message.get("timestamp", ""),
+        })
+    return {
+        "_meta": {
+            "schema": "rescued-session/v1",
+            "platform": "claude",
+            "source": {
+                "kind": "native-claude-transcript",
+                "session_id": session_id,
+                "note": reason or "",
+                "files": [{
+                    "name": source.get("path", "").replace("\\", "/").split("/")[-1],
+                    "sha256": source.get("sha256", ""),
+                    "bytes": source.get("bytes", 0),
+                } for source in (result.get("sources") or [])],
+            },
+            "conversation_count": 1,
+            "coverage": result.get("coverage") or {},
+            "verification": {
+                "ok": bool(result.get("sources")) and bool(transcript),
+                "scope": "native Claude parser result and source hash",
+                "checks": {
+                    "parsed_content_present": bool(transcript),
+                    "source_hash_present": bool(result.get("sources")) and all(
+                        source.get("sha256")
+                        for source in (result.get("sources") or [])),
+                },
+            },
+        },
+        "conversations": [{
+            "id": session_id,
+            "title": result.get("session_title") or session_id,
+            "inserted_at": (transcript[0]["timestamp"] if transcript else ""),
+            "updated_at": (transcript[-1]["timestamp"] if transcript else ""),
+            "rescue_reason": reason,
+            "stats": {
+                "user_message_count": result.get("total_user_msgs", 0),
+                "agent_message_count": result.get("total_agent_msgs", 0),
+            },
+            "attachments": [],
+            "transcript": transcript,
+            "raw_mapping": None,
+        }],
+    }
 
 
 def _openai_variant_path(out_path):
@@ -642,7 +804,7 @@ Common flags:
   --verify        多重集自证（没丢没重）"""
 
 
-def main(argv=None):
+def main(argv=None, entry_mode="read"):
     args = list(sys.argv[1:] if argv is None else argv)
 
     if not args:
@@ -650,6 +812,7 @@ def main(argv=None):
         sys.exit(1)
 
     mode = "full"
+    handoff_mode = entry_mode == "handoff"
     filepath = None
     platform = None
     home = None
@@ -758,6 +921,10 @@ def main(argv=None):
         if not t3_reference:
             print("ERROR: --platform t3 requires --session <T3 thread reference>")
             return 2
+        if handoff_mode and not out:
+            print("ERROR: handoff requires an explicit --out <product.json>",
+                  file=sys.stderr)
+            return 2
         if as_shape != "rescued":
             print("ERROR: T3 thread products use the T3 provenance schema; --as openai is not supported.")
             return 2
@@ -773,10 +940,7 @@ def main(argv=None):
                 print(json.dumps(product["verification"], ensure_ascii=False, indent=2))
                 return 3
         if out:
-            out_parent = os.path.dirname(os.path.abspath(out))
-            os.makedirs(out_parent, exist_ok=True)
-            with open(out, "w", encoding="utf-8") as f:
-                json.dump(product, f, ensure_ascii=False, indent=2, default=str)
+            _write_json_atomic(out, product)
         if markdown:
             if not out:
                 print("ERROR: --markdown for T3 requires --out <product.json>")
@@ -794,18 +958,26 @@ def main(argv=None):
                     print("Markdown: " + os.path.abspath(os.path.splitext(out)[0] + ".md"))
         return 0
 
+    session_paths = []
     # Resolve native Codex / Claude IDs only after all options are parsed.
     if session_ref:
-        detected_platform, detected_path = find_session(session_ref, home)
-        if not detected_path:
-            print(f"ERROR: Cannot find native session file for ID {session_ref}")
-            print("  Searched: ~/.codex/sessions/ and ~/.claude/projects/")
-            print("  For T3 links, use --platform t3 or t3-context://v1/thread/<id>.")
+        detected_platform, session_paths = find_session(
+            session_ref, home, platform=platform)
+        if not session_paths:
+            print(f"ERROR: Cannot find native session file for ID {session_ref}",
+                  file=sys.stderr)
+            print("  Searched: ~/.codex/sessions/, ~/.codex/archived_sessions/ "
+                  "and ~/.claude/projects/ by session metadata.",
+                  file=sys.stderr)
+            print("  For T3 links, use --platform t3 or "
+                  "t3-context://v1/thread/<id>.", file=sys.stderr)
             return 1
         platform = platform or detected_platform
-        filepath = detected_path
-        print(f"Found [{platform}]: {filepath}")
-        print()
+        filepath = session_paths[0]
+        print(f"Found [{platform}]: {len(session_paths)} source file(s)",
+              file=sys.stderr)
+        for path in session_paths:
+            print(f"  {path}", file=sys.stderr)
 
     # --- 语料库检索模式（DeepSeek 导出包）---
     if scan_file:
@@ -841,6 +1013,10 @@ def main(argv=None):
     # --- DeepSeek 分享链接分支：参数是 share_id / URL，不是文件路径 ---
     # 必须排在 os.path.isfile() 检查之前。
     if platform == "deepseek-share":
+        if handoff_mode and not (out or outdir):
+            print("ERROR: handoff requires an explicit --out or --outdir",
+                  file=sys.stderr)
+            return 2
         sys.exit(run_deepseek_share_extract(
             filepath, title, out, outdir, reason, markdown, verify,
             as_shape=as_shape
@@ -865,8 +1041,12 @@ def main(argv=None):
         # → 显式指定时与探测结果**交叉校验**，不一致就报错退出。
         try:
             detected = detect_platform(filepath)
-        except ValueError:
+        except (ValueError, UnicodeDecodeError):
             detected = "unknown"
+        if str(filepath).lower().endswith(".zst"):
+            # Compressed sources are decoded by codex_core, not probed as
+            # plain text; a failed text probe must not reject a valid source.
+            detected = platform
         if detected != "unknown" and detected != platform:
             print("ERROR: --platform {} 与文件实际格式（{}）不一致".format(
                 platform, detected))
@@ -875,6 +1055,10 @@ def main(argv=None):
 
     # --- DeepSeek 分支：打捞成独立 JSON ---
     if platform == "deepseek":
+        if handoff_mode and not (out or outdir):
+            print("ERROR: handoff requires an explicit --out or --outdir",
+                  file=sys.stderr)
+            return 2
         sys.exit(run_deepseek_extract(filepath, ids, extract_all, out, outdir, reason,
                                       markdown, verify, as_shape=as_shape))
 
@@ -886,48 +1070,116 @@ def main(argv=None):
         print("  例：python session_extract.py --platform claude " + filepath)
         sys.exit(1)
 
-    size_mb = os.path.getsize(filepath) / (1024 * 1024)
-    if size_mb > 10:
-        print(f"NOTE: File is {size_mb:.1f}MB, streaming line-by-line")
-        print()
+    # Native handoff requires an explicit destination: exit 0 without a file
+    # would be a false success regardless of how complete the parse was.
+    if handoff_mode:
+        if not out:
+            print("ERROR: handoff requires an explicit --out <product.json>",
+                  file=sys.stderr)
+            return 2
+        if platform not in ("codex", "claude"):
+            print("ERROR: handoff for --platform {} is routed through its own "
+                  "DeepSeek/T3 writer; use read for those sources.".format(platform),
+                  file=sys.stderr)
+            return 2
 
-    result = extract(filepath, platform)
+    sizes = [os.path.getsize(path) / (1024 * 1024) for path in session_paths]
+    if any(size > 10 for size in sizes):
+        print("NOTE: streaming large source(s): {}".format(
+            ", ".join("{:.1f}MB".format(size) for size in sizes)), file=sys.stderr)
+
+    if session_ref and session_paths and platform == "codex":
+        result = extract_codex.extract_many(session_paths)
+    elif session_ref and session_paths and platform == "claude":
+        result = extract_claude(session_paths[0])
+        result["sources"] = [{
+            "path": session_paths[0],
+            "sha256": _sha256_path(session_paths[0]),
+            "bytes": os.path.getsize(session_paths[0]),
+            "readable": True,
+        }]
+        result["coverage"] = {
+            "source_enumeration": "claude-projects-jsonl",
+            "body_read": "full-jsonl-pass",
+            "message_counts": "observed-records-not-human-turns",
+            "sha256": result["sources"][0]["sha256"],
+            "complete": False,
+        }
+    else:
+        result = extract(filepath, platform)
 
     # ⚠️ **什么都没解析出来 = 报错**，不是「一份全 0 的报告 + exit 0」。
     # 用户看到 exit 0 会以为「这个会话就这么短」——而真实情况是**格式不对**。
     if not (result.get("user_msgs") or result.get("agent_texts")
             or result.get("total_user_msgs") or result.get("total_agent_msgs")):
+        unreadable = (result.get("coverage") or {}).get("compressed_sources") or []
+        unreadable = [item for item in unreadable if not item.get("readable")]
+        if unreadable:
+            detail = ", ".join(
+                "{} (decoder={})".format(item.get("path"), item.get("decoder"))
+                for item in unreadable)
+            print("ERROR: 该压缩来源无法解码，未读取任何正文: " + detail,
+                  file=sys.stderr)
+            print("  Install zstandard or use Python 3.14+ for zstd support.",
+                  file=sys.stderr)
+            sys.exit(1)
         print("ERROR: 从这个文件里**没有解析出任何会话内容**。")
         print("  可能原因：文件格式与 --platform {} 不符，或该文件不是会话记录。".format(platform))
         print("  去掉 --platform 让脚本自动探测试试。")
         sys.exit(1)
 
-    if as_json:
-        # ⚠️ 以前 --json 只在 --scan 路径被消费，Claude/Codex 路径**完全无视**它
-        # —— 一个静默的空开关：用户加了 --json 却拿到人读文本，还以为没生效。
-        # 现在它对所有路径都有效：输出机器可读的 JSON。
-        out = {
-            "platform": result.get("platform"),
-            "session_info": result.get("session_info") or {},
-            "session_title": result.get("session_title") or "",
-            "user_msgs": result.get("user_msgs") or [],
-            "agent_texts": result.get("agent_texts") or [],
-            "tool_uses": result.get("tool_uses") or [],
-            "tool_use_counts": dict(result.get("tool_use_counts") or {}),
-            "file_changes": result.get("file_changes") or [],
-            "system_events": result.get("system_events") or [],
-            "queue_ops": result.get("queue_ops") or [],
-            "compacted_summaries": result.get("compacted_summaries") or [],
-            "totals": {
-                "user_msgs": result.get("total_user_msgs", 0),
-                "agent_msgs": result.get("total_agent_msgs", 0),
-                "tool_results": result.get("total_tool_results", 0),
-                "api_errors": result.get("api_errors", 0),
-                "turn_aborted": result.get("turn_aborted", 0),
-            },
+    if handoff_mode:
+        session_id = (result.get("session_info") or {}).get("sessionId") or session_ref
+        if platform == "codex":
+            product = extract_codex.build_product(
+                result, session_id=session_id, source_note=reason or "")
+        else:
+            product = _claude_product(result, session_id=session_id, reason=reason)
+        if verify:
+            verification = (product.get("_meta") or {}).get("verification") or {}
+            if not verification.get("ok"):
+                print(json.dumps(verification, ensure_ascii=False, indent=2),
+                      file=sys.stderr)
+                return 3
+        target = _write_json_atomic(out, product)
+        receipt = {
+            "wrote": target,
+            "sha256": _sha256_path(target),
+            "bytes": os.path.getsize(target),
+            "platform": platform,
+            "session_id": session_id,
+            "verification": (product.get("_meta") or {}).get("verification"),
         }
-        print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+        if as_shape == "openai":
+            variant = _write_openai_variant(
+                (product.get("_meta") or {}), product.get("conversations") or [],
+                _openai_variant_path(target), title=title)
+            if variant:
+                receipt["openai_variant"] = variant
+        if as_json:
+            print(json.dumps(receipt, ensure_ascii=False, indent=2))
+        else:
+            print("wrote " + target)
+            if receipt.get("openai_variant"):
+                print("wrote " + receipt["openai_variant"])
+            if verify:
+                print("VERIFY RESULT: PASS")
         return 0
+
+    if as_json:
+        # Keep stdout machine-readable; diagnostics already went to stderr.
+        view = _native_view(result, platform)
+        if verify:
+            view["verification"] = _native_verification(result, platform)
+        if out:
+            _write_json_atomic(out, view)
+            print("wrote " + os.path.abspath(out), file=sys.stderr)
+        print(json.dumps(view, ensure_ascii=False, indent=2, default=str))
+        return 0
+
+    if out:
+        _write_json_atomic(out, _native_view(result, platform))
+        print("wrote " + os.path.abspath(out), file=sys.stderr)
 
     if mode == "full":
         print_full(result)

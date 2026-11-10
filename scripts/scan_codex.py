@@ -20,6 +20,7 @@ from scan_common import (
     short_cwd,
     truncate,
 )
+import codex_core
 
 
 FULL_PARSE_MAX_BYTES = 20 * 1024 * 1024
@@ -54,7 +55,11 @@ def load_thread_titles(home=None):
                 continue
             current = titles.get(sid)
             updated = parse_time(obj.get("updated_at"))
-            if current is None or (updated and updated >= current.get("updated_at_dt")):
+            if current is None or (
+                updated is not None
+                and (current.get("updated_at_dt") is None
+                     or updated >= current["updated_at_dt"])
+            ):
                 titles[sid] = {
                     "title": obj.get("thread_name", "") or sid,
                     "updated_at_dt": updated,
@@ -65,7 +70,9 @@ def load_thread_titles(home=None):
 def iter_codex_files(home=None):
     for root in codex_roots(home):
         if root.exists():
-            yield from root.rglob("*.jsonl")
+            files = list(root.rglob("*.jsonl"))
+            files.extend(root.rglob("*.jsonl.zst"))
+            yield from sorted(set(files))
 
 
 def find_session_files(session_id, platform="all", home=None):
@@ -83,11 +90,17 @@ def codex_file_has_primary_session(path, session_id):
 
     UUIDs also appear in parent_thread_id/forked_from_id fields. Those are
     related sessions, not the primary thread identity for --session lookup.
+    A filename is a discovery hint, never proof of primary identity.
     """
+    path = Path(path)
+    if path.suffix.lower() == ".zst":
+        source = codex_core.parse_source(path)
+        return bool(source.get("readable")
+                    and source.get("session_id") == session_id)
     saw_meta = False
     meta_lines = 0
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as f:
             for line in f:
                 if '"session_meta"' not in line:
                     if saw_meta:
@@ -101,7 +114,7 @@ def codex_file_has_primary_session(path, session_id):
                     break
     except OSError:
         return False
-    return not saw_meta and session_id in path.name
+    return False
 
 
 def _primary_id_from_session_meta_line(line):
@@ -128,6 +141,7 @@ def scan(days=7, project=None, grep=None, session_id=None, home=None):
         if not wanted_files:
             return []
 
+    seen_hashes = {}
     for path in iter_codex_files(home):
         if wanted_files is not None and path not in wanted_files:
             continue
@@ -139,17 +153,31 @@ def scan(days=7, project=None, grep=None, session_id=None, home=None):
         sid = summary["id"]
         if session_id and sid != session_id:
             continue
+        digest = summary.get("sha256")
+        if digest and digest in seen_hashes:
+            group = groups[sid]
+            group.setdefault("duplicate_paths", []).append(str(path))
+            continue
+        if digest:
+            seen_hashes[digest] = path
         group = groups[sid]
         _merge_group(group, summary, path)
 
     records = []
-    cutoff_ok = _days_filter(days)
+    cutoff_ok = _days_filter(0 if session_id else days)
     for sid, group in groups.items():
         title = titles.get(sid) or group["title"] or sid
         display = title if title and title != sid else display_name_from_cwd(group["cwd"], sid)
-        first_msg = group["user_messages"][0] if group["user_messages"] else ""
-        last_msg = group["user_messages"][-1] if len(group["user_messages"]) > 1 else first_msg
-        grep_text = " ".join(group["user_messages"][-20:] + group["agent_messages"][-10:])
+        user_messages = _ordered_texts(group["user_events"], group["user_messages"])
+        first_msg = user_messages[0] if user_messages else ""
+        last_msg = user_messages[-1] if len(user_messages) > 1 else first_msg
+        # The radar advertises truncated recent excerpts, so the grep surface
+        # is deliberately bounded rather than silently treated as exhaustive.
+        grep_text = " ".join(
+            user_messages[-20:]
+            + group["agent_messages"][-10:]
+            + ([first_msg, last_msg] if first_msg or last_msg else [])
+        )
         record = make_record(
             platform="codex",
             id=sid,
@@ -166,13 +194,68 @@ def scan(days=7, project=None, grep=None, session_id=None, home=None):
             grep_text=grep_text,
             source_path=group["source_path"],
         )
+        record["coverage"] = {
+            "source_enumeration": "jsonl+zst-discovery",
+            "body_read": ("head-tail" if group["sampled_source_count"]
+                          else ("unreadable" if group["unreadable_count"]
+                                else "full-jsonl-pass")),
+            "sampled_source_count": group["sampled_source_count"],
+            "message_counts": "observed-records-not-human-turns",
+            "search_scope": "truncated-recent-excerpts",
+            "malformed_lines": group["malformed_lines"],
+            "incomplete_tail": group["incomplete_tail"],
+            "mirrored_response_items": group["mirrored_response_items"],
+            "compressed_unreadable": list(group["compressed_unreadable"]),
+            "identity_source": ("session-meta" if group["readable_count"]
+                                else "filename-hint"),
+            "complete": False,
+        }
+        record["source_paths"] = list(group["source_paths"])
+        record["duplicate_source_paths"] = list(group["duplicate_paths"])
         record["workspace"] = short_cwd(group["cwd"])
         record["cwd_compact"] = compact_path(group["cwd"])
-        if cutoff_ok(record) and matches_filters(record, project=project, grep=grep):
+        if cutoff_ok(record) and _matches_with_bounded_rescan(
+                record, group, project=project, grep=grep):
             records.append(record)
 
     records.sort(key=lambda r: r["last_active_ts"], reverse=True)
     return records
+
+
+def _matches_with_bounded_rescan(record, group, *, project=None, grep=None):
+    """Apply radar filters, rescanning stored texts before reporting no match.
+
+    The radar still advertises truncated excerpts: this rescan only widens the
+    literal check to text already parsed for the record, and records that it
+    happened. It does not index the source or claim exhaustive coverage.
+    """
+    if matches_filters(record, project=project, grep=grep):
+        return True
+    if not grep or project and not matches_filters(record, project=project):
+        return False
+    needle = grep.lower()
+    haystack = " ".join([
+        record.get("first_message", ""),
+        record.get("last_message", ""),
+        record.get("_grep_text", ""),
+    ] + [text for _, text in group.get("user_events", [])]
+      + [text for _, text in group.get("agent_events", [])]).lower()
+    if needle in haystack:
+        record.setdefault("coverage", {})["search_scope"] = (
+            "truncated-excerpts+literal-rescan")
+        return True
+    return False
+
+
+def _ordered_texts(events, fallback):
+    """Order messages by native event time, not by file enumeration order."""
+    if not events:
+        return list(fallback)
+    ordered = sorted(
+        enumerate(events),
+        key=lambda item: (item[1][0] or "9999", item[0]),
+    )
+    return [text for _, (_, text) in ordered]
 
 
 def parse_codex_file(path):
@@ -182,135 +265,111 @@ def parse_codex_file(path):
         return None
     if size > FULL_PARSE_MAX_BYTES:
         return parse_codex_file_sampled(path, size)
-
-    data = {
-        "id": "",
-        "title": "",
-        "cwd": "",
-        "last_active_dt": None,
-        "user_turns": 0,
-        "agent_turns": 0,
-        "user_messages": [],
-        "agent_messages": [],
-        "total_size_bytes": size,
-    }
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if '"session_meta"' not in line and '"event_msg"' not in line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                ts = parse_time(obj.get("timestamp"))
-                if ts and (data["last_active_dt"] is None or ts > data["last_active_dt"]):
-                    data["last_active_dt"] = ts
-                typ = obj.get("type")
-                if typ == "session_meta":
-                    _parse_meta(obj, data)
-                elif typ == "event_msg":
-                    _parse_event(obj, data)
-                # Intentionally skip response_item/reasoning/tool output. Codex
-                # rollouts can contain encrypted reasoning, screenshots, and
-                # large tool outputs; event_msg has the readable scan surface.
-    except OSError:
-        return None
-    if not data["id"]:
-        data["id"] = _id_from_filename(path)
-    if not data["id"]:
-        return None
-    if data["last_active_dt"] is None:
-        data["last_active_dt"] = parse_time(path.stat().st_mtime)
-    return data
+    return _summary_from_core(codex_core.parse_source(path))
 
 
 def parse_codex_file_sampled(path, size):
     """Parse only head and tail windows for very large Codex rollouts."""
-    data = {
-        "id": "",
-        "title": "",
-        "cwd": "",
-        "last_active_dt": None,
-        "user_turns": 0,
-        "agent_turns": 0,
-        "user_messages": [],
-        "agent_messages": [],
-        "total_size_bytes": size,
+    return _summary_from_core(
+        codex_core.parse_source(path, sampled=True, sample_bytes=SAMPLE_BYTES))
+
+
+def _summary_from_core(source):
+    """Adapt the shared core result to the radar's compact record shape."""
+    if not source.get("readable"):
+        # Keep the source visible without pretending we know its identity or
+        # contents. The id here is only a filename hint for display.
+        return {
+            "id": source.get("session_id") or "",
+            "title": "",
+            "cwd": "",
+            "last_active_dt": None,
+            "user_turns": 0,
+            "agent_turns": 0,
+            "user_messages": [],
+            "agent_messages": [],
+            "user_events": [],
+            "agent_events": [],
+            "total_size_bytes": source.get("bytes") or 0,
+            "sha256": source.get("sha256") or "",
+            "sampled": False,
+            "malformed_lines": 0,
+            "incomplete_tail": False,
+            "mirrored_response_items": 0,
+            "compressed_unreadable": [
+                item.get("path")
+                for item in (source.get("coverage") or {}).get(
+                    "compressed_sources", [])
+            ],
+            "coverage": source.get("coverage") or {},
+            "readable": False,
+            "identity_source": "filename-hint",
+        }
+    events = source.get("events") or []
+    user_messages = []
+    agent_messages = []
+    user_events = []
+    agent_events = []
+    user_turns = 0
+    agent_turns = 0
+    last_active_dt = None
+    for event in events:
+        timestamp = parse_time(event.get("timestamp"))
+        if timestamp and (last_active_dt is None or timestamp > last_active_dt):
+            last_active_dt = timestamp
+        text = event.get("text") or ""
+        if not text.strip():
+            continue
+        role = event.get("role")
+        if role == "user":
+            if is_noise(text):
+                continue
+            user_turns += 1
+            user_messages.append(truncate(text, 2000))
+            user_events.append((event.get("timestamp") or "", text))
+        elif role == "assistant":
+            agent_turns += 1
+            agent_messages.append(truncate(text, 2000))
+            agent_events.append((event.get("timestamp") or "", text))
+    session_id = source.get("session_id") or ""
+    if not session_id:
+        return None
+    if last_active_dt is None:
+        last_active_dt = parse_time(path_mtime(source["path"]))
+    coverage = dict(source.get("coverage") or {})
+    compressed_unreadable = [
+        item.get("path") for item in coverage.get("compressed_sources", [])
+        if not item.get("readable")
+    ]
+    return {
+        "id": session_id,
+        "title": source.get("title") or "",
+        "cwd": source.get("cwd") or "",
+        "last_active_dt": last_active_dt,
+        "user_turns": user_turns,
+        "agent_turns": agent_turns,
+        "user_messages": user_messages,
+        "agent_messages": agent_messages,
+        "user_events": user_events,
+        "agent_events": agent_events,
+        "total_size_bytes": source.get("bytes") or 0,
+        "sha256": source.get("sha256") or "",
+        "sampled": (coverage.get("body_read") == "head-tail"),
+        "malformed_lines": source.get("malformed_lines") or 0,
+        "incomplete_tail": bool(source.get("incomplete_tail")),
+        "mirrored_response_items": source.get("mirrored_response_items") or 0,
+        "compressed_unreadable": compressed_unreadable,
+        "coverage": coverage,
+        "readable": True,
+        "identity_source": "session-meta",
     }
+
+
+def path_mtime(path):
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as text_file:
-            first_line = text_file.readline()
-            if first_line:
-                _parse_relevant_line(first_line, data)
-        with path.open("rb") as f:
-            head = f.read(SAMPLE_BYTES)
-            if size > SAMPLE_BYTES:
-                f.seek(max(0, size - SAMPLE_BYTES))
-                tail = f.read(SAMPLE_BYTES)
-            else:
-                tail = b""
+        return Path(path).stat().st_mtime
     except OSError:
         return None
-
-    for chunk in (head, tail):
-        if not chunk:
-            continue
-        for raw_line in chunk.decode("utf-8", errors="ignore").splitlines():
-            if '"session_meta"' not in raw_line and '"event_msg"' not in raw_line:
-                continue
-            _parse_relevant_line(raw_line, data)
-
-    if not data["id"]:
-        data["id"] = _id_from_filename(path)
-    if not data["id"]:
-        return None
-    if data["last_active_dt"] is None:
-        data["last_active_dt"] = parse_time(path.stat().st_mtime)
-    return data
-
-
-def _parse_relevant_line(line, data):
-    try:
-        obj = json.loads(line)
-    except json.JSONDecodeError:
-        return
-    ts = parse_time(obj.get("timestamp"))
-    if ts and (data["last_active_dt"] is None or ts > data["last_active_dt"]):
-        data["last_active_dt"] = ts
-    typ = obj.get("type")
-    if typ == "session_meta":
-        _parse_meta(obj, data)
-    elif typ == "event_msg":
-        _parse_event(obj, data)
-
-
-def _parse_meta(obj, data):
-    payload = obj.get("payload", {})
-    data["id"] = payload.get("id") or data["id"]
-    data["cwd"] = payload.get("cwd") or data["cwd"]
-    meta_ts = parse_time(payload.get("timestamp"))
-    if meta_ts and (data["last_active_dt"] is None or meta_ts > data["last_active_dt"]):
-        data["last_active_dt"] = meta_ts
-
-
-def _parse_event(obj, data):
-    payload = obj.get("payload", {})
-    etype = payload.get("type", "")
-    message = payload.get("message", "")
-    if etype == "user_message":
-        if isinstance(message, str) and message.strip() and not is_noise(message):
-            data["user_turns"] += 1
-            data["user_messages"].append(truncate(message, 2000))
-    elif etype == "agent_message":
-        if isinstance(message, str) and message.strip():
-            data["agent_turns"] += 1
-            data["agent_messages"].append(truncate(message, 2000))
-    elif etype == "task_complete":
-        text = payload.get("last_agent_message", "")
-        if isinstance(text, str) and text.strip():
-            data["agent_turns"] += 1
-            data["agent_messages"].append(truncate(text, 2000))
 
 
 def _id_from_filename(path):
@@ -332,17 +391,43 @@ def _new_group():
         "total_size_bytes": 0,
         "user_messages": [],
         "agent_messages": [],
+        "user_events": [],
+        "agent_events": [],
         "source_path": "",
+        "source_paths": [],
+        "duplicate_paths": [],
+        "sampled_source_count": 0,
+        "malformed_lines": 0,
+        "incomplete_tail": False,
+        "mirrored_response_items": 0,
+        "compressed_unreadable": [],
+        "readable_count": 0,
+        "unreadable_count": 0,
     }
 
 
 def _merge_group(group, summary, path):
+    group["source_paths"].append(str(path))
+    if summary.get("readable", True):
+        group["readable_count"] += 1
+    else:
+        group["unreadable_count"] += 1
+    group["sampled_source_count"] += int(summary.get("sampled", False))
+    group["malformed_lines"] += int(summary.get("malformed_lines") or 0)
+    group["incomplete_tail"] = (group["incomplete_tail"]
+                                or bool(summary.get("incomplete_tail")))
+    group["mirrored_response_items"] += int(
+        summary.get("mirrored_response_items") or 0)
+    group["compressed_unreadable"].extend(
+        summary.get("compressed_unreadable") or [])
     group["rollout_count"] += 1
     group["total_size_bytes"] += summary["total_size_bytes"]
     group["user_turns"] += summary["user_turns"]
     group["agent_turns"] += summary["agent_turns"]
     group["user_messages"].extend(summary["user_messages"])
     group["agent_messages"].extend(summary["agent_messages"])
+    group["user_events"].extend(summary.get("user_events") or [])
+    group["agent_events"].extend(summary.get("agent_events") or [])
     if summary["cwd"]:
         group["cwd"] = summary["cwd"]
     if group["last_active_dt"] is None or summary["last_active_dt"] > group["last_active_dt"]:

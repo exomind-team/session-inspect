@@ -13,6 +13,10 @@ The Agent-facing contract is in `SKILL.md`. Invoke the bundled dispatcher at `sc
 
 This repository creates no persistent index or database of its own. Original sessions and the existing T3 state database are read-only; exports should be written to an explicit destination outside this repository.
 
+## Codex core
+
+`scripts/codex_core.py` is the single implementation of Codex source identity, JSONL framing, message-body extraction, mirror relations, ordering metadata and coverage statistics. The radar (`scan_codex.py`), the detailed reader (`extract_codex.py`) and the T3 native enrichment all resolve Codex sessions through this core, so their identity and body semantics cannot drift. Do not add a second Codex parser; extend the core instead.
+
 ## Install
 
 Clone this repository into a user-level skills directory:
@@ -34,6 +38,8 @@ python scripts/session_inspect.py read --platform t3 --session "t3-context://v1/
 python scripts/session_inspect.py read --platform t3 --session "t3-context://v1/thread/thread_<uuid>" --out <out.json>
 python scripts/session_inspect.py read --platform deepseek-share <share-url> --outdir <dir> --verify
 python scripts/session_inspect.py convert <product.json> --out <chatgpt.json>
+python scripts/session_inspect.py handoff --session <uuid> --out <product.json> --verify
+python scripts/session_inspect.py handoff --session <uuid> --out <product.json> --as openai
 ```
 
 Run `python scripts/session_inspect.py <mode> --help` for mode-specific options.
