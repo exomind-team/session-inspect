@@ -13,12 +13,13 @@ import session_extract
 import session_review
 import to_openai
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 HELP = f"""session-inspect {VERSION}
 
 Usage:
   python session_inspect.py overview [options]
   python session_inspect.py find --scan <conversations.json> --kw <term> [--kw <term> ...]
+  python session_inspect.py find --session <uuid> --literal <text> [--json]
   python session_inspect.py read [options]
   python session_inspect.py merge --merge <export.json> --merge-with <share.json> [options]
   python session_inspect.py handoff [options] --out <product.json>
@@ -35,7 +36,7 @@ Modes:
 Run '<mode> --help' for mode-specific options.
 """
 MODE_HELP = {
-    "find": "Usage: session_inspect.py find --scan <conversations.json> --kw <term> [--kw <term> ...] [--top N] [--json]",
+    "find": "Usage: session_inspect.py find --scan <conversations.json> --kw <term> [--kw <term> ...] [--top N] [--json]\n       session_inspect.py find --session <uuid> --literal <text> [--case-sensitive] [--json]",
     "read": "Usage: session_inspect.py read [source] [options]",
     "merge": "Usage: session_inspect.py merge --merge <export.json> --merge-with <share.json> [--out <result.json> | --outdir <dir>] [--markdown]",
     "handoff": "Usage: session_inspect.py handoff [source] --out <product.json> [--as rescued|openai] [--verify]",
@@ -50,6 +51,10 @@ EXTRACT_OPTIONS_HELP = """Source options:
   --all                          Export every DeepSeek conversation
   --scan <conversations.json>    DeepSeek corpus search (use with --kw)
   --kw <term>                    Corpus keyword; repeatable
+  --literal <text>               Exact literal search over native Codex sources
+  --case-sensitive               Make --literal case-sensitive
+  --cursor <token>               Resume a budgeted read page
+  --budget <chars>               Character budget for one read page (default 6000)
   --top <N>                      Corpus search result limit
   --home <dir>                   Override local agent data home
   --t3-db <file>                 Override the read-only T3 statev2.sqlite path
@@ -102,7 +107,7 @@ def main(argv=None):
         if rest in (["-h"], ["--help"]):
             _print_extract_help(mode)
             return 0
-        if "--scan" not in rest:
+        if "--scan" not in rest and "--literal" not in rest:
             print(MODE_HELP[mode], file=sys.stderr)
             return 2
         return _extract_main(rest)

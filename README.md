@@ -40,6 +40,14 @@ python scripts/session_inspect.py read --platform deepseek-share <share-url> --o
 python scripts/session_inspect.py convert <product.json> --out <chatgpt.json>
 python scripts/session_inspect.py handoff --session <uuid> --out <product.json> --verify
 python scripts/session_inspect.py handoff --session <uuid> --out <product.json> --as openai
+python scripts/session_inspect.py find --session <uuid> --literal "不做计费" --json
+python scripts/session_inspect.py read --session <uuid> --budget 6000 --json
 ```
+
+## Strict search and paging
+
+`find --session <uuid> --literal <text>` is an exhaustive literal query over the declared native Codex scope. It returns native spans, a source snapshot hash and an explicit `complete`/`partial` status; it does not reuse the radar's truncated excerpt index.
+
+`read --budget <chars>` returns one page of the logical event stream with an opaque `next_cursor`. Cursors are bound to the source snapshot and to the selection: a retried cursor returns the same page, consecutive cursors do not overlap or skip text, and a modified source returns `SOURCE_CHANGED` instead of silently changing the page. No read ledger is persisted.
 
 Run `python scripts/session_inspect.py <mode> --help` for mode-specific options.

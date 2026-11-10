@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import base64
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -30,6 +31,204 @@ UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
+CURSOR_SCHEMA = 1
+ADAPTER_VERSION = "codex-core/1"
+
+
+class CursorError(ValueError):
+    """An opaque cursor that cannot be trusted for this request."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def snapshot_id(sources) -> str:
+    """Bind a cursor to the exact source snapshot it was produced from."""
+    rows = sorted(
+        "{}:{}".format(source.get("sha256") or "", source.get("path") or "")
+        for source in sources
+    )
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(row.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def encode_cursor(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_cursor(token: str) -> Dict[str, Any]:
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - invalid input is a client error
+        raise CursorError("INVALID_CURSOR", "cursor is not valid base64 JSON") from exc
+    if not isinstance(payload, dict):
+        raise CursorError("INVALID_CURSOR", "cursor payload must be an object")
+    if payload.get("schema_version") != CURSOR_SCHEMA:
+        raise CursorError(
+            "CURSOR_SCHEMA_MISMATCH",
+            "cursor schema_version {} is not supported".format(
+                payload.get("schema_version")))
+    if payload.get("adapter_version") != ADAPTER_VERSION:
+        raise CursorError(
+            "CURSOR_ADAPTER_MISMATCH",
+            "cursor adapter_version does not match this reader")
+    if not payload.get("snapshot"):
+        raise CursorError("INVALID_CURSOR", "cursor lacks a snapshot binding")
+    for key in ("event_index", "char_offset"):
+        value = payload.get(key)
+        if not isinstance(value, int) or value < 0:
+            raise CursorError("INVALID_CURSOR",
+                              "cursor field {} is invalid".format(key))
+    # A cursor is data, never a path or code: reject unknown fields that could
+    # be mistaken for an instruction to read something else.
+    allowed = {"schema_version", "adapter_version", "snapshot", "selection",
+               "event_index", "char_offset"}
+    extra = set(payload) - allowed
+    if extra:
+        raise CursorError("INVALID_CURSOR",
+                          "cursor has unsupported fields: {}".format(", ".join(sorted(extra))))
+    return payload
+
+
+def find_literal(events, needle: str, *, case_sensitive: bool = False) -> List[Dict[str, Any]]:
+    """Strict literal search over already parsed events.
+
+    Returns every occurrence with its native position and character span. This
+    is an exhaustive query over the declared source scope, not a radar sample.
+    """
+    if not needle:
+        raise ValueError("literal search needs a non-empty needle")
+    haystack_needle = needle if case_sensitive else needle.lower()
+    hits: List[Dict[str, Any]] = []
+    for index, event in enumerate(events):
+        text = event.get("text") or ""
+        haystack = text if case_sensitive else text.lower()
+        start = haystack.find(haystack_needle)
+        while start != -1:
+            end = start + len(needle)
+            hits.append({
+                "event_index": index,
+                "role": event.get("role") or "",
+                "timestamp": event.get("timestamp") or "",
+                "channel": event.get("channel") or "",
+                "native_id": event.get("native_id") or "",
+                "span": {"start": start, "end": end},
+                "context": text[max(0, start - 50):min(len(text), end + 50)],
+                "match": text[start:end],
+            })
+            start = haystack.find(haystack_needle, end)
+    return hits
+
+
+def paginate_events(
+    events,
+    *,
+    sources,
+    cursor: Optional[str] = None,
+    budget_chars: int = 6000,
+    selection: str = "messages",
+) -> Dict[str, Any]:
+    """Deliver events within a character budget using an opaque cursor.
+
+    Cursors are bound to the source snapshot. A repeated cursor on an unchanged
+    snapshot returns the same page; consecutive cursors never overlap and never
+    skip a text fragment.
+    """
+    if budget_chars <= 0:
+        raise ValueError("budget_chars must be positive")
+    snapshot = snapshot_id(sources)
+    if cursor:
+        state = decode_cursor(cursor)
+        if state["snapshot"] != snapshot:
+            raise CursorError(
+                "SOURCE_CHANGED",
+                "source snapshot changed since this cursor was issued")
+        if state.get("selection") != selection:
+            raise CursorError(
+                "CURSOR_SELECTION_MISMATCH",
+                "cursor was issued for selection {}".format(state.get("selection")))
+        index = state["event_index"]
+        offset = state["char_offset"]
+    else:
+        index = 0
+        offset = 0
+
+    items: List[Dict[str, Any]] = []
+    delivered = 0
+    continuation = False
+    while index < len(events) and delivered < budget_chars:
+        event = events[index]
+        text = event.get("text") or ""
+        remaining_budget = budget_chars - delivered
+        if offset >= len(text):
+            index += 1
+            offset = 0
+            continue
+        take = min(len(text) - offset, remaining_budget)
+        if take <= 0:
+            break
+        chunk = text[offset:offset + take]
+        items.append({
+            "event_index": index,
+            "role": event.get("role") or "",
+            "timestamp": event.get("timestamp") or "",
+            "channel": event.get("channel") or "",
+            "native_id": event.get("native_id") or "",
+            "text": chunk,
+            "span": {"start": offset, "end": offset + take},
+            "text_length": len(text),
+            "continued": offset > 0,
+            "truncated": offset + take < len(text),
+        })
+        delivered += take
+        offset += take
+        if offset >= len(text):
+            index += 1
+            offset = 0
+        else:
+            continuation = True
+            break
+
+    # Skip trailing events that have no deliverable text so a finished page
+    # does not emit a cursor pointing at an empty tail.
+    while index < len(events) and not (events[index].get("text") or ""):
+        index += 1
+    exhausted = index >= len(events)
+    next_cursor = None
+    if not exhausted:
+        next_cursor = encode_cursor({
+            "schema_version": CURSOR_SCHEMA,
+            "adapter_version": ADAPTER_VERSION,
+            "snapshot": snapshot,
+            "selection": selection,
+            "event_index": index,
+            "char_offset": offset,
+        })
+    return {
+        "status": "complete" if exhausted else "partial",
+        "snapshot": snapshot,
+        "selection": selection,
+        "budget": {
+            "unit": "chars",
+            "requested": budget_chars,
+            "delivered": delivered,
+        },
+        "items": items,
+        "next_cursor": next_cursor,
+        "continuation": continuation,
+        "coverage": {
+            "event_count": len(events),
+            "events_delivered_through": index,
+            "complete": exhausted,
+        },
+    }
 
 
 def sha256_file(path) -> str:

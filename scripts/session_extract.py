@@ -33,6 +33,7 @@ import extract_deepseek_share
 import merge_deepseek
 import t3code
 import scan_codex
+import codex_core
 
 
 # ============================================================
@@ -372,6 +373,39 @@ def run_scan(scan_file, keywords, top, as_json):
     else:
         print_scan(results, keywords, len(corpus))
     return 0
+
+
+def run_literal_find(paths, needle, *, case_sensitive=False, as_json=False):
+    """Strict literal search over explicit native Codex sources."""
+    parsed = [codex_core.parse_source(path) for path in paths]
+    readable = [source for source in parsed if source.get("readable")]
+    unreadable = [source for source in parsed if not source.get("readable")]
+    merged = codex_core.merge_sources(readable)
+    hits = codex_core.find_literal(
+        merged.get("events") or [], needle, case_sensitive=case_sensitive)
+    result = {
+        "status": "complete" if not unreadable else "partial",
+        "mode": "exact",
+        "query": {"literal": needle, "case_sensitive": case_sensitive},
+        "snapshot": codex_core.snapshot_id(readable),
+        "hit_count": len(hits),
+        "hits": hits,
+        "coverage": {
+            "sources": [source.get("path") for source in readable],
+            "unreadable": [source.get("path") for source in unreadable],
+            "complete": not unreadable,
+        },
+    }
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    else:
+        print("literal: {!r} | hits: {} | case_sensitive: {}".format(
+            needle, len(hits), case_sensitive))
+        for hit in hits:
+            print("  {} [{}:{}] {}".format(
+                hit["timestamp"] or "-", hit["span"]["start"],
+                hit["span"]["end"], hit["context"].replace("\n", " ")))
+    return 0 if result["status"] == "complete" else 4
 
 
 def _write_json(path, obj):
@@ -835,6 +869,11 @@ def main(argv=None, entry_mode="read"):
     verify = False
     as_json = False
     as_shape = "rescued"
+    literal = None
+    case_sensitive = False
+    cursor = None
+    budget_chars = 6000
+    selection = "messages"
 
     i = 0
     while i < len(args):
@@ -902,6 +941,18 @@ def main(argv=None, entry_mode="read"):
             if as_shape not in ("rescued", "openai"):
                 print("ERROR: --as 只能是 rescued 或 openai")
                 sys.exit(1)
+        elif args[i] == "--literal" and i + 1 < len(args):
+            literal = args[i + 1]
+            i += 2
+        elif args[i] == "--case-sensitive":
+            case_sensitive = True
+            i += 1
+        elif args[i] == "--cursor" and i + 1 < len(args):
+            cursor = args[i + 1]
+            i += 2
+        elif args[i] == "--budget" and i + 1 < len(args):
+            budget_chars = int(args[i + 1])
+            i += 2
         elif args[i] in ("--help", "-h"):
             print(USAGE)
             sys.exit(0)
@@ -974,6 +1025,8 @@ def main(argv=None, entry_mode="read"):
             return 1
         platform = platform or detected_platform
         filepath = session_paths[0]
+        # Keep diagnostics, but never let them imply a result. JSON mode must
+        # still keep stdout pure, so these go to stderr unconditionally.
         print(f"Found [{platform}]: {len(session_paths)} source file(s)",
               file=sys.stderr)
         for path in session_paths:
@@ -981,10 +1034,31 @@ def main(argv=None, entry_mode="read"):
 
     # --- 语料库检索模式（DeepSeek 导出包）---
     if scan_file:
+        if literal:
+            print("ERROR: --literal cannot be combined with --scan", file=sys.stderr)
+            return 2
         if not os.path.isfile(scan_file):
             print(f"ERROR: File not found: {scan_file}")
             sys.exit(1)
         sys.exit(run_scan(scan_file, keywords, top, as_json))
+
+    # --- strict literal search over native Codex sources ---
+    if literal:
+        if scan_file:
+            print("ERROR: --literal cannot be combined with --scan", file=sys.stderr)
+            return 2
+        if not session_paths:
+            if not filepath:
+                print("ERROR: --literal needs --session <uuid> or source file(s)",
+                      file=sys.stderr)
+                return 2
+            session_paths = [filepath]
+        if platform not in (None, "codex"):
+            print("ERROR: --literal currently supports native Codex sources only; "
+                  "use find --scan for DeepSeek corpora.", file=sys.stderr)
+            return 2
+        return run_literal_find(
+            session_paths, literal, case_sensitive=case_sensitive, as_json=as_json)
 
     # --- 跨源并集：导出包 × 分享链接 ---
     # 必须在 "No input file specified" 检查之前——并集模式不需要位置参数。
@@ -1164,6 +1238,30 @@ def main(argv=None, entry_mode="read"):
                 print("wrote " + receipt["openai_variant"])
             if verify:
                 print("VERIFY RESULT: PASS")
+        return 0
+
+    # Budgeted paging over the logical event stream.
+    if platform == "codex" and (cursor or budget_chars != 6000):
+        sources = result.get("sources") or []
+        events = []
+        for source in sources:
+            events.extend(source.get("events") or [])
+        try:
+            page = codex_core.paginate_events(
+                events, sources=sources, cursor=cursor,
+                budget_chars=budget_chars, selection=selection)
+        except codex_core.CursorError as exc:
+            print(json.dumps({
+                "status": "error",
+                "error": {"code": exc.code, "message": str(exc),
+                          "retryable": False},
+            }, ensure_ascii=False, indent=2))
+            return 5
+        page["platform"] = "codex"
+        page["session_info"] = result.get("session_info") or {}
+        if out:
+            _write_json_atomic(out, page)
+        print(json.dumps(page, ensure_ascii=False, indent=2, default=str))
         return 0
 
     if as_json:
