@@ -2,6 +2,12 @@
 
 Unified entry point for T3Code thread entry, native Codex and Claude Code sessions, and DeepSeek conversation histories.
 
+It also reads ChatGPT share links (`https://chatgpt.com/s/...`) and signed-in
+conversations through a controllable browser tab. The share page renders its
+content client-side, so a plain HTTP request returns a shell; the browser path
+reads the rendered DOM and can download listed attachments into an explicit
+output directory.
+
 Public repository: <https://github.com/exomind-team/session-inspect>
 
 This repository supersedes two retired, archived skills:
@@ -42,7 +48,25 @@ python scripts/session_inspect.py handoff --session <uuid> --out <product.json> 
 python scripts/session_inspect.py handoff --session <uuid> --out <product.json> --as openai
 python scripts/session_inspect.py find --session <uuid> --literal "不做计费" --json
 python scripts/session_inspect.py read --session <uuid> --budget 6000 --json
+python scripts/session_inspect.py read --platform chatgpt-share "https://chatgpt.com/s/t_..." --outdir <dir> --verify
+python scripts/session_inspect.py read --platform chatgpt "https://chatgpt.com/g/g-p-.../c/<uuid>" --outdir <dir>
 ```
+
+## ChatGPT web capture
+
+`chatgpt-share` and `chatgpt` require the `web-access` CDP proxy (default
+`http://localhost:3456`, override with `--proxy`). The collector:
+
+- reads the rendered transcript by turn and message id;
+- lists attachments and images separately as listed / fetched;
+- downloads attachment bytes only through the page's own download control
+  into an explicit `--outdir`, with SHA-256 recorded;
+- never exports cookies, session tokens or other credentials;
+- reports `ACCESS_DENIED` when the signed-in account cannot open the
+  conversation, and `CONTENT_NOT_RENDERED` when the page yields no transcript.
+
+`coverage.complete` is always `false` for web capture: the DOM view is what the
+page rendered in this session, not the workspace's stored record.
 
 ## Strict search and paging
 

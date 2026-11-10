@@ -8,5 +8,7 @@
 | Claude Code local history | `overview`; targeted extraction | JSONL messages, tool blocks, sidecar/session metadata where supported | Project/session aggregation differs from Codex thread aggregation. |
 | DeepSeek account export | `find --scan`; `read --platform deepseek` | `conversations.json` mapping tree and native node/fragment data | Export bundles may contain attachment metadata without bytes and omit some tool payloads or reference mappings. |
 | DeepSeek share link | `read --platform deepseek-share` | Shared final-state messages, references, and available attachments | It represents the shared snapshot; earlier edited/deleted turns may be absent. |
+| ChatGPT share link | `read --platform chatgpt-share` | Rendered DOM messages, listed images/files, attachment bytes fetched on request | Content is fetched client-side; a plain HTTP request only returns a shell. The share view is a snapshot, not the live conversation, and may omit attachments. |
+| ChatGPT signed-in conversation | `read --platform chatgpt` | Rendered DOM messages in the signed-in browser session | Requires the account/workspace to have access. Reasoning, tool payloads and unrendered branches are out of scope. Never exports credentials. |
 
 A cross-source merge is a union of available evidence, not proof that either source is complete. Preserve per-node source labels and unknowns. Do not infer a citation-to-result mapping when the source format does not carry that relation.

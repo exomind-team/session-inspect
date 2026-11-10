@@ -13,7 +13,7 @@ import session_extract
 import session_review
 import to_openai
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 HELP = f"""session-inspect {VERSION}
 
 Usage:
@@ -22,6 +22,7 @@ Usage:
   python session_inspect.py find --session <uuid> --literal <text> [--json]
   python session_inspect.py read [options]
   python session_inspect.py merge --merge <export.json> --merge-with <share.json> [options]
+  python session_inspect.py read --platform chatgpt-share "https://chatgpt.com/s/t_..." --outdir <dir>
   python session_inspect.py handoff [options] --out <product.json>
   python session_inspect.py convert <product.json> [--out <chatgpt.json>]
 
@@ -32,12 +33,13 @@ Modes:
   merge     Merge DeepSeek export and share-link products
   handoff   Create a sourced extraction product
   convert   Convert an extraction product for ChatGPT/OpenAI
+  chatgpt-* Read ChatGPT share links or signed-in conversations via a browser
 
 Run '<mode> --help' for mode-specific options.
 """
 MODE_HELP = {
     "find": "Usage: session_inspect.py find --scan <conversations.json> --kw <term> [--kw <term> ...] [--top N] [--json]\n       session_inspect.py find --session <uuid> --literal <text> [--case-sensitive] [--json]",
-    "read": "Usage: session_inspect.py read [source] [options]",
+    "read": "Usage: session_inspect.py read [source] [options]\n       session_inspect.py read --platform chatgpt-share <share-url> --outdir <dir>",
     "merge": "Usage: session_inspect.py merge --merge <export.json> --merge-with <share.json> [--out <result.json> | --outdir <dir>] [--markdown]",
     "handoff": "Usage: session_inspect.py handoff [source] --out <product.json> [--as rescued|openai] [--verify]",
     "convert": "Usage: session_inspect.py convert <product.json> [--out <chatgpt.json>] [--slim] [--strict] [--stats]",
@@ -46,7 +48,7 @@ MODE_HELP = {
 EXTRACT_OPTIONS_HELP = """Source options:
   --session <id>                 Locate a local session or exact T3 thread reference
   --summary <file>               Print only a work summary
-  --platform codex|claude|t3|deepseek|deepseek-share
+  --platform codex|claude|t3|deepseek|deepseek-share|chatgpt|chatgpt-share
   --ids <id>[,<id>]              DeepSeek export conversation IDs/prefixes
   --all                          Export every DeepSeek conversation
   --scan <conversations.json>    DeepSeek corpus search (use with --kw)
@@ -58,6 +60,7 @@ EXTRACT_OPTIONS_HELP = """Source options:
   --top <N>                      Corpus search result limit
   --home <dir>                   Override local agent data home
   --t3-db <file>                 Override the read-only T3 statev2.sqlite path
+  --proxy <url>                  CDP proxy for ChatGPT capture (default http://localhost:3456)
 
 Output options:
   --out <file>                   Single output file
