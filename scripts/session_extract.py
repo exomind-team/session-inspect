@@ -951,7 +951,7 @@ USAGE = """Usage:
 
   --t3-db <file>  T3 状态库路径覆盖（只读）
   --home <dir>    覆盖本地 Agent 数据根目录
-  --browser-context <id>  固定使用 /targets 返回的一个 Edge 账号上下文；不会跨账号重试
+  --browser-context <id>  固定使用 /targets 返回的浏览器上下文；不会切换上下文重试
 
 Output shape:
   --as rescued   rescued-session/v1（默认，忠实产物）

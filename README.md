@@ -65,10 +65,12 @@ python scripts/session_inspect.py read --platform chatgpt "https://chatgpt.com/g
   20-second total attachment pass;
 - writes the verified transcript product before attempting attachment downloads,
   so a slow or unavailable file does not discard readable messages;
-- accepts `--browser-context` to pin signed-in reads to one Edge account; it
-  does not retry a different account after `ACCESS_DENIED`;
+- accepts `--browser-context` to route signed-in reads through one browser
+  context; it does not retry a different context after `ACCESS_DENIED`;
+- uses the context identifier only for routing and omits it from products and
+  diagnostic messages;
 - never exports cookies, session tokens or other credentials;
-- reports `ACCESS_DENIED` when the signed-in account cannot open the
+- reports `ACCESS_DENIED` when the selected browser context cannot open the
   conversation, and `CONTENT_NOT_RENDERED` when the page yields no transcript.
 
 `coverage.complete` is always `false` for web capture: the DOM view is what the

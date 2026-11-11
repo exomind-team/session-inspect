@@ -102,7 +102,7 @@ def proxy_ready(proxy: str = DEFAULT_PROXY) -> bool:
 
 
 def list_contexts(proxy: str = DEFAULT_PROXY) -> Dict[str, list]:
-    """Group open tabs by browser context (Edge account/profile partition)."""
+    """Group open tabs by browser context."""
     raw = _request("/targets", proxy=proxy, timeout=20)
     targets = json.loads(raw.decode("utf-8-sig"))
     contexts: Dict[str, list] = {}
@@ -343,8 +343,8 @@ def wait_for_content(target: str, *, proxy: str = DEFAULT_PROXY,
             if state.get("denied"):
                 raise BrowserError(
                     "ACCESS_DENIED",
-                    "the signed-in account cannot open this conversation; "
-                    "confirm the account and workspace, or use a share link")
+                    "the selected browser context cannot open this conversation; "
+                    "use a context with access, or use a share link")
             has_message_structure = state.get("turns", 0) > 0 and (
                 state.get("roles", 0) > 0 or state.get("contentUnits", 0) > 0)
             has_rendered_payload = (
@@ -500,21 +500,21 @@ def _host_for_context(targets) -> str:
 
 def open_in_context(context_id: str, url: str, *, proxy: str = DEFAULT_PROXY,
                     targets=None, timeout_s: int = 15) -> str:
-    """Open a new tab inside an existing browser context (Edge account).
+    """Open a new tab inside an existing browser context.
 
     ``Target.createTarget`` is not exposed by the proxy, so a real click on a
     synthetic ``target=_blank`` link is used: it carries a user gesture and
-    therefore lands in the same account partition as the host tab.
+    therefore lands in the same browser context as the host tab.
     """
     if targets is None:
         targets = list_contexts(proxy).get(context_id, [])
     if not targets:
         raise BrowserError("BROWSER_CONTEXT_NOT_FOUND",
-                           "browser context {} has no open page".format(context_id))
+                           "browser context has no open page")
     host = _host_for_context(targets)
     if not host:
         raise BrowserError("NO_CONTEXT_TAB",
-                           "browser context {} has no page to open from".format(context_id))
+                           "browser context has no page to open from")
     before = {target.get("targetId") for target in targets}
     script = OPEN_IN_CONTEXT_SCRIPT % json.dumps(url, ensure_ascii=False)
     evaluate(host, script, proxy=proxy, timeout=30)
@@ -544,7 +544,7 @@ def open_in_context(context_id: str, url: str, *, proxy: str = DEFAULT_PROXY,
         if not new_target:
             raise BrowserError("CONTEXT_TAB_NOT_OPENED",
                                "clicking a link did not create a tab in the selected "
-                               "browser context {}".format(context_id),
+                               "browser context",
                                retryable=True)
 
         target_id = new_target["targetId"]
@@ -592,9 +592,10 @@ def capture_conversation(url: str, *, proxy: str = DEFAULT_PROXY,
                          browser_context_id: Optional[str] = None) -> Dict[str, Any]:
     """Open a conversation and return a structural snapshot.
 
-    ``browser_context_id`` pins navigation to one existing Edge account
-    context. Access failures are returned for that account; the collector
-    never falls through to a different account.
+    ``browser_context_id`` selects one existing browser context for navigation.
+    The identifier is used only for routing: it is omitted from the returned
+    snapshot and diagnostics. Access failures never fall through to another
+    browser context.
     """
     if not is_supported_url(url):
         raise BrowserError("UNSUPPORTED_URL",
@@ -617,8 +618,7 @@ def capture_conversation(url: str, *, proxy: str = DEFAULT_PROXY,
     targets = contexts.get(browser_context_id)
     if targets is None:
         raise BrowserError("BROWSER_CONTEXT_NOT_FOUND",
-                           "browser context {} is not present in the running "
-                           "browser".format(browser_context_id))
+                           "selected browser context is not present in the running browser")
     target = open_in_context(browser_context_id, url, proxy=proxy,
                              targets=targets)
     captured = False
@@ -627,7 +627,6 @@ def capture_conversation(url: str, *, proxy: str = DEFAULT_PROXY,
             target, url, proxy=proxy,
             max_scroll_rounds=max_scroll_rounds,
             download_attachments=download_attachments)
-        snapshot["browser_context_id"] = browser_context_id
         captured = True
         return snapshot
     finally:
