@@ -50,6 +50,7 @@ python scripts/session_inspect.py find --session <uuid> --literal "不做计费"
 python scripts/session_inspect.py read --session <uuid> --budget 6000 --json
 python scripts/session_inspect.py read --platform chatgpt-share "https://chatgpt.com/s/t_..." --outdir <dir> --verify
 python scripts/session_inspect.py read --platform chatgpt "https://chatgpt.com/g/g-p-.../c/<uuid>" --outdir <dir>
+python scripts/session_inspect.py read --platform chatgpt "https://chatgpt.com/g/g-p-.../c/<uuid>" --browser-context <id> --outdir <dir> --verify
 ```
 
 ## ChatGPT web capture
@@ -60,7 +61,12 @@ python scripts/session_inspect.py read --platform chatgpt "https://chatgpt.com/g
 - reads the rendered transcript by turn and message id;
 - lists attachments and images separately as listed / fetched;
 - downloads attachment bytes only through the page's own download control
-  into an explicit `--outdir`, with SHA-256 recorded;
+  into an explicit `--outdir`, with SHA-256 recorded, within a bounded
+  20-second total attachment pass;
+- writes the verified transcript product before attempting attachment downloads,
+  so a slow or unavailable file does not discard readable messages;
+- accepts `--browser-context` to pin signed-in reads to one Edge account; it
+  does not retry a different account after `ACCESS_DENIED`;
 - never exports cookies, session tokens or other credentials;
 - reports `ACCESS_DENIED` when the signed-in account cannot open the
   conversation, and `CONTENT_NOT_RENDERED` when the page yields no transcript.

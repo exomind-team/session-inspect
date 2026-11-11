@@ -1,13 +1,14 @@
-"""Synthetic contracts for ChatGPT web capture normalization.
+"""Synthetic contracts for ChatGPT web capture normalization and retrieval bounds.
 
 No browser, network or real conversation is used here: the snapshot fixtures
-mirror the DOM shape verified manually (turn key -> role heading -> markdown),
-so the normalizer's guarantees are testable offline.
+mirror the normalized DOM shape verified manually, so the output contract and
+bounded failure behavior can be tested offline.
 """
 import base64
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -131,6 +132,47 @@ class UrlBoundary(unittest.TestCase):
             "https://chatgpt.com/s/t_abc"))
         self.assertFalse(chatgpt_web.is_share_url(
             "https://chatgpt.com/g/g-p-x/c/abc"))
+
+
+class BrowserRequestErrors(unittest.TestCase):
+    def test_proxy_timeout_is_structured_and_retryable(self):
+        with patch("chatgpt_web.urllib.request.urlopen", side_effect=TimeoutError):
+            with self.assertRaises(chatgpt_web.BrowserError) as ctx:
+                chatgpt_web._request("/hover?target=t", proxy="http://localhost")
+        self.assertEqual(ctx.exception.code, "BROWSER_TIMEOUT")
+        self.assertTrue(ctx.exception.retryable)
+
+    def test_short_rendered_transcript_does_not_wait_for_body_threshold(self):
+        state = {
+            "turns": 1, "roles": 2, "contentUnits": 2,
+            "transcriptTextLen": 12, "resources": 0, "md": 1,
+            "textLen": 200, "denied": False,
+        }
+        with patch.object(chatgpt_web, "evaluate", return_value=state), \
+                patch.object(chatgpt_web.time, "sleep") as sleep:
+            result = chatgpt_web.wait_for_content("target", timeout_s=2)
+        self.assertEqual(result["transcriptTextLen"], 12)
+        sleep.assert_not_called()
+
+
+class AttachmentBudget(unittest.TestCase):
+    def test_zero_budget_marks_files_unattempted_without_browser_io(self):
+        snapshot = {
+            "target": "target-1",
+            "attachments": [
+                {"name": "a.md", "downloadable": True},
+                {"name": "b.md", "downloadable": True},
+            ],
+        }
+        url = "https://chatgpt.com/s/t_synthetic"
+        with patch.object(chatgpt_web, "fetch_attachment",
+                          side_effect=AssertionError("must not start a download")):
+            result = chatgpt_web.fetch_attachments(
+                snapshot, url, time_budget_s=0)
+        self.assertEqual([item["status"] for item in result["attachments"]],
+                         ["not-attempted", "not-attempted"])
+        self.assertTrue(all(not item["bytes_available"]
+                            for item in result["attachments"]))
 
 
 if __name__ == "__main__":

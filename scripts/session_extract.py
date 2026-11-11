@@ -410,7 +410,8 @@ def run_literal_find(paths, needle, *, case_sensitive=False, as_json=False):
 
 
 def run_chatgpt_capture(url, *, out, outdir, title, reason, verify, as_json,
-                        as_shape, download_attachments, handoff, proxy):
+                        as_shape, download_attachments, handoff, proxy,
+                        browser_context_id=None):
     """Capture a ChatGPT share/private conversation through a browser tab."""
     import chatgpt_core
     import chatgpt_web
@@ -423,9 +424,12 @@ def run_chatgpt_capture(url, *, out, outdir, title, reason, verify, as_json,
         print("ERROR: only https://chatgpt.com/ share or conversation URLs "
               "are supported", file=sys.stderr)
         return 2
+    fetch_attachments = bool(download_attachments and outdir)
     try:
         snapshot = chatgpt_web.capture_conversation(
-            url, proxy=proxy, download_attachments=download_attachments)
+            url, proxy=proxy, keep_tab=fetch_attachments,
+            download_attachments=False,
+            browser_context_id=browser_context_id)
     except chatgpt_web.BrowserError as exc:
         print(json.dumps({
             "status": "error",
@@ -433,61 +437,67 @@ def run_chatgpt_capture(url, *, out, outdir, title, reason, verify, as_json,
                       "retryable": bool(exc.retryable)},
         }, ensure_ascii=False, indent=2), file=sys.stderr)
         return 1
+    open_target = snapshot.get("target") if fetch_attachments else None
     try:
-        normalized = chatgpt_core.normalize_browser_snapshot(snapshot)
-    except chatgpt_core.ChatGPTError as exc:
-        print(json.dumps({
-            "status": "error",
-            "error": {"code": exc.code, "message": str(exc)},
-        }, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 1
-    product = chatgpt_core.build_product(
-        normalized, title=title or "", reason=reason or "",
-        include_base64=bool(outdir))
-    if verify:
-        verification = product["_meta"].get("verification") or {}
-        if not verification.get("ok"):
-            print(json.dumps(verification, ensure_ascii=False, indent=2),
-                  file=sys.stderr)
-            return 3
-    target = None
-    if out:
-        target = _write_json_atomic(out, product)
-    elif outdir:
-        os.makedirs(outdir, exist_ok=True)
-        base = (normalized.get("source", {}).get("title") or "chatgpt")
-        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in base)[:80]
-        target = _write_json_atomic(
-            os.path.join(outdir, (safe or "chatgpt") + ".json"), product)
-        for item in product["conversations"][0].get("attachments") or []:
-            if item.get("bytes_available") and item.get("content_base64"):
-                data = base64.b64decode(item["content_base64"])
-                name = "".join(
-                    ch if ch.isalnum() or ch in "-_. " else "_"
-                    for ch in (item.get("name") or "attachment"))
-                path = os.path.join(outdir, name)
-                with open(path, "wb") as handle:
-                    handle.write(data)
-                item["saved_to"] = os.path.abspath(path)
-        if target:
-            _write_json_atomic(target, product)
-    payload = {
-        "status": "ok",
-        "platform": normalized.get("platform"),
-        "coverage": normalized.get("coverage"),
-        "snapshot_sha256": normalized.get("snapshot_sha256"),
-        "message_count": len(normalized.get("messages") or []),
-        "attachments": product["conversations"][0].get("attachments"),
-        "images": product["conversations"][0].get("images"),
-        "wrote": target,
-    }
-    if as_json or not target:
-        print(json.dumps(payload if not target else product,
-                         ensure_ascii=False, indent=2, default=str))
-    else:
-        print("wrote " + target)
-        print("messages: {}".format(payload["message_count"]))
-    return 0
+        try:
+            normalized = chatgpt_core.normalize_browser_snapshot(snapshot)
+        except chatgpt_core.ChatGPTError as exc:
+            print(json.dumps({"status": "error",
+                              "error": {"code": exc.code, "message": str(exc)}},
+                             ensure_ascii=False, indent=2), file=sys.stderr)
+            return 1
+        product = chatgpt_core.build_product(
+            normalized, title=title or "", reason=reason or "",
+            include_base64=bool(outdir))
+        if verify:
+            verification = product["_meta"].get("verification") or {}
+            if not verification.get("ok"):
+                print(json.dumps(verification, ensure_ascii=False, indent=2),
+                      file=sys.stderr)
+                return 3
+
+        # Persist the verified transcript before attempting any file downloads.
+        target = _write_chatgpt_product(product, out=out, outdir=outdir)
+        capture_status = "ok"
+        if fetch_attachments and snapshot.get("attachments"):
+            try:
+                snapshot = chatgpt_web.fetch_attachments(
+                    snapshot, url, proxy=proxy,
+                    time_budget_s=chatgpt_web.ATTACHMENT_DOWNLOAD_TIME_BUDGET_SECONDS)
+                normalized = chatgpt_core.normalize_browser_snapshot(snapshot)
+                product = chatgpt_core.build_product(
+                    normalized, title=title or "", reason=reason or "",
+                    include_base64=True)
+                target = _write_chatgpt_product(product, out=out, outdir=outdir)
+            except (chatgpt_web.BrowserError, chatgpt_core.ChatGPTError) as exc:
+                capture_status = "partial"
+                print(json.dumps({
+                    "status": "partial",
+                    "error": {"code": getattr(exc, "code", "ATTACHMENT_CAPTURE_FAILED"),
+                              "message": str(exc)},
+                    "wrote": target,
+                }, ensure_ascii=False, indent=2), file=sys.stderr)
+
+        payload = {
+            "status": capture_status,
+            "platform": normalized.get("platform"),
+            "coverage": normalized.get("coverage"),
+            "snapshot_sha256": normalized.get("snapshot_sha256"),
+            "message_count": len(normalized.get("messages") or []),
+            "attachments": product["conversations"][0].get("attachments"),
+            "images": product["conversations"][0].get("images"),
+            "wrote": target,
+        }
+        if as_json or not target:
+            print(json.dumps(payload if not target else product,
+                             ensure_ascii=False, indent=2, default=str))
+        else:
+            print("wrote " + target)
+            print("messages: {}".format(payload["message_count"]))
+        return 0
+    finally:
+        if open_target:
+            chatgpt_web.close_tab(open_target, proxy=proxy)
 
 
 def _write_json(path, obj):
@@ -509,6 +519,37 @@ def _write_json_atomic(path, obj):
         os.fsync(f.fileno())
     os.replace(temp, target)
     return target
+
+
+def _write_chatgpt_product(product, *, out, outdir):
+    """Persist the current ChatGPT product and any attachment bytes it owns."""
+    if out:
+        return _write_json_atomic(out, product)
+    if not outdir:
+        return None
+
+    os.makedirs(outdir, exist_ok=True)
+    conversation = (product.get("conversations") or [{}])[0]
+    base = (product.get("_meta", {}).get("source", {}).get("title") or "chatgpt")
+    safe_title = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in base)[:80]
+    product_path = os.path.join(outdir, f"{safe_title or 'chatgpt'}.json")
+    for item in conversation.get("attachments") or []:
+        if not item.get("bytes_available") or not item.get("content_base64"):
+            continue
+        name = "".join(
+            ch if ch.isalnum() or ch in "-_. " else "_"
+            for ch in os.path.basename(item.get("name") or "attachment"))
+        if name in ("", ".", ".."):
+            name = "attachment"
+        attachment_path = os.path.abspath(os.path.join(outdir, name))
+        try:
+            with open(attachment_path, "wb") as handle:
+                handle.write(base64.b64decode(item["content_base64"]))
+            item["saved_to"] = attachment_path
+        except OSError as exc:
+            item["save_status"] = "failed"
+            item["save_note"] = str(exc)
+    return _write_json_atomic(product_path, product)
 
 
 def _sha256_path(path):
@@ -904,12 +945,13 @@ USAGE = """Usage:
   python session_extract.py --platform deepseek <conversations.json> --ids <id>[,<id>] [--out <out.json> | --outdir <dir>]
   python session_extract.py --platform deepseek-share <share_id|share_url> [--out <out.json> | --outdir <dir>]
   python session_extract.py --platform chatgpt-share <share_url> [--out <out.json> | --outdir <dir>]
-  python session_extract.py --platform chatgpt <conversation_url> [--out <out.json> | --outdir <dir>] [--proxy <url>]
+  python session_extract.py --platform chatgpt <conversation_url> [--out <out.json> | --outdir <dir>] [--proxy <url>] [--browser-context <id>]
   python session_extract.py --merge <export-product.json> --merge-with <share-product.json> [--outdir <dir>]
   python session_extract.py --scan <conversations.json> --kw <keyword> [--kw <keyword>...] [--top N]
 
   --t3-db <file>  T3 状态库路径覆盖（只读）
   --home <dir>    覆盖本地 Agent 数据根目录
+  --browser-context <id>  固定使用 /targets 返回的一个 Edge 账号上下文；不会跨账号重试
 
 Output shape:
   --as rescued   rescued-session/v1（默认，忠实产物）
@@ -959,6 +1001,7 @@ def main(argv=None, entry_mode="read"):
     budget_chars = 6000
     selection = "messages"
     chatgpt_proxy = "http://localhost:3456"
+    browser_context_id = None
 
     i = 0
     while i < len(args):
@@ -1040,6 +1083,9 @@ def main(argv=None, entry_mode="read"):
             i += 2
         elif args[i] == "--proxy" and i + 1 < len(args):
             chatgpt_proxy = args[i + 1]
+            i += 2
+        elif args[i] == "--browser-context" and i + 1 < len(args):
+            browser_context_id = args[i + 1]
             i += 2
         elif args[i] in ("--help", "-h"):
             print(USAGE)
@@ -1194,7 +1240,7 @@ def main(argv=None, entry_mode="read"):
             filepath, out=out, outdir=outdir, title=title, reason=reason,
             verify=verify, as_json=as_json, as_shape=as_shape,
             download_attachments=bool(outdir), handoff=handoff_mode,
-            proxy=chatgpt_proxy)
+            proxy=chatgpt_proxy, browser_context_id=browser_context_id)
 
     if not os.path.isfile(filepath):
         if (platform is None and isinstance(filepath, str)

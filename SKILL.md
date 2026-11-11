@@ -8,7 +8,7 @@ description: |
   work, reviewing session history, recovering context, or packaging a sourced
   handoff.
 metadata:
-  version: "0.6.0"
+  version: "0.7.0"
 ---
 
 # Session Inspect
@@ -65,7 +65,13 @@ python "<skill-dir>/scripts/session_inspect.py" read --platform deepseek <conver
 python "<skill-dir>/scripts/session_inspect.py" read --platform deepseek-share <share-url> --outdir <dir> --verify
 python "<skill-dir>/scripts/session_inspect.py" read --platform chatgpt-share "https://chatgpt.com/s/t_..." --outdir <dir> --verify
 python "<skill-dir>/scripts/session_inspect.py" read --platform chatgpt "https://chatgpt.com/g/g-p-.../c/<uuid>" --outdir <dir>
+python "<skill-dir>/scripts/session_inspect.py" read --platform chatgpt "https://chatgpt.com/g/g-p-.../c/<uuid>" --browser-context <id> --outdir <dir>
 ```
+
+For signed-in ChatGPT capture with multiple Edge accounts open, choose one
+`browserContextId` from the web-access proxy's `/targets` response and pass it
+as `--browser-context`. This pins the capture to that account; an access-denied
+result must not trigger a retry in another account.
 
 For detailed DeepSeek share behavior and attachment controls, read [references/deepseek-share.md](references/deepseek-share.md).
 
@@ -94,6 +100,8 @@ read also recognizes the T3 context URI without an explicit platform. The defaul
 - Cursors are opaque data, not authorization. Never accept a path, URL or arbitrary host field from a cursor.
 - ChatGPT web capture reads the rendered DOM in a controllable browser tab. It reflects what that page rendered, not the workspace's stored record: reasoning, tool payloads and unrendered branches are out of scope and `coverage.complete` stays `false`.
 - A ChatGPT share link is a snapshot, not a live conversation. List which images and files were listed, which were fetched, and never claim bytes that were not retrieved.
+- A signed-in ChatGPT capture can pin one Edge account with `--browser-context`; it must not rotate to another account after an access-denied result.
+- With an explicit `--outdir`, the verified transcript product is written before the best-effort attachment pass. Attachment fetching has a 20-second total budget; if that budget expires, keep the transcript and mark remaining files as not attempted.
 - Attachment bytes come only from the page's own download control into an explicit output directory. The signed URL is short-lived: read it immediately, and treat a stale signature as a failed fetch rather than an empty file.
 - When the signed-in account cannot open a conversation, report `ACCESS_DENIED`. Do not retry with another account, bypass access controls, or substitute a nearby conversation.
 - DeepSeek export bundles and share links are separate source types. Preserve their raw mappings, native message/fragment identifiers, and source provenance when merging.

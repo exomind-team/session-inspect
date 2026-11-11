@@ -13,7 +13,7 @@ import session_extract
 import session_review
 import to_openai
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 HELP = f"""session-inspect {VERSION}
 
 Usage:
@@ -61,6 +61,7 @@ EXTRACT_OPTIONS_HELP = """Source options:
   --home <dir>                   Override local agent data home
   --t3-db <file>                 Override the read-only T3 statev2.sqlite path
   --proxy <url>                  CDP proxy for ChatGPT capture (default http://localhost:3456)
+  --browser-context <id>         Pin ChatGPT capture to one Edge account context; never retries another account
 
 Output options:
   --out <file>                   Single output file
