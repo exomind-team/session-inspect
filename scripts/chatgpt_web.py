@@ -10,15 +10,27 @@ from __future__ import annotations
 
 import json
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import base64
 import hashlib
 from typing import Any, Dict, Optional
 
+# CDP 代理原语统一放在 browser_proxy，别的抓取路径（如 DeepSeek 登录态会话）
+# 复用同一套，避免「同一事实两处实现」漂移。
+# 这里 re-export，让 chatgpt_web.X 的既有调用点与测试继续成立。
+from browser_proxy import (  # noqa: F401
+    BrowserError,
+    DEFAULT_PROXY,
+    _request,
+    close_tab,
+    evaluate,
+    list_contexts,
+    navigate,
+    open_tab,
+    proxy_ready,
+)
 
-DEFAULT_PROXY = "http://localhost:3456"
+
 MAX_SCROLL_ROUNDS = 60
 SCROLL_SETTLE_MS = 700
 ATTACHMENT_DOWNLOAD_TIME_BUDGET_SECONDS: float = 20.0
@@ -51,107 +63,6 @@ ATTACHMENT_SHORT_INFO_TIMEOUT_SECONDS: float = 1.0
 '''Short page-state read timeout inside the attachment budget.'''
 ATTACHMENT_REBIND_TIMEOUT_SECONDS: float = 2.0
 '''Maximum time to wait for a hover-revealed attachment button.'''
-
-
-class BrowserError(RuntimeError):
-    """The browser surface could not be driven or yielded nothing usable."""
-
-    def __init__(self, code, message, *, retryable=False):
-        super().__init__(message)
-        self.code = code
-        self.retryable = retryable
-
-
-def _request(path: str, *, proxy: str, data: Optional[bytes] = None,
-             timeout: int = 60) -> bytes:
-    url = proxy.rstrip("/") + path
-    request = urllib.request.Request(
-        url, data=data, method="POST" if data is not None else "GET")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace").strip()
-        raise BrowserError(
-            "BROWSER_PROXY_ERROR",
-            "browser proxy returned HTTP {}{}".format(
-                exc.code, ": " + detail[:1200] if detail else ""),
-            retryable=exc.code >= 500,
-        ) from exc
-    except TimeoutError as exc:
-        endpoint = path.partition("?")[0]
-        raise BrowserError(
-            "BROWSER_TIMEOUT",
-            f"browser proxy request timed out after {timeout}s at {endpoint}",
-            retryable=True,
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise BrowserError(
-            "BROWSER_UNAVAILABLE",
-            "cannot reach the browser proxy at {}: {}".format(proxy, exc),
-            retryable=True,
-        ) from exc
-
-
-def proxy_ready(proxy: str = DEFAULT_PROXY) -> bool:
-    try:
-        _request("/targets", proxy=proxy, timeout=5)
-        return True
-    except BrowserError:
-        return False
-
-
-def list_contexts(proxy: str = DEFAULT_PROXY) -> Dict[str, list]:
-    """Group open tabs by browser context."""
-    raw = _request("/targets", proxy=proxy, timeout=20)
-    targets = json.loads(raw.decode("utf-8-sig"))
-    contexts: Dict[str, list] = {}
-    for target in targets:
-        if target.get("type") != "page":
-            continue
-        context = target.get("browserContextId") or ""
-        contexts.setdefault(context, []).append(target)
-    return contexts
-
-
-def open_tab(url: str, *, proxy: str = DEFAULT_PROXY) -> str:
-    query = urllib.parse.urlencode({"url": url})
-    payload = json.loads(_request("/new?" + query, proxy=proxy, timeout=90))
-    target = payload.get("targetId") or ""
-    if not target:
-        raise BrowserError("TAB_CREATE_FAILED", "proxy did not return a target id")
-    return target
-
-
-def close_tab(target: str, *, proxy: str = DEFAULT_PROXY) -> None:
-    try:
-        _request("/close?target=" + urllib.parse.quote(target),
-                 proxy=proxy, timeout=20)
-    except BrowserError:
-        pass
-
-
-def navigate(target: str, url: str, *, proxy: str = DEFAULT_PROXY,
-             timeout_s: int = 60) -> None:
-    query = urllib.parse.urlencode({"target": target, "url": url})
-    _request("/navigate?" + query, proxy=proxy, timeout=timeout_s)
-
-
-def evaluate(target: str, script: str, *, proxy: str = DEFAULT_PROXY,
-             timeout: int = 90) -> Any:
-    raw = _request("/eval?target=" + urllib.parse.quote(target),
-                   proxy=proxy, data=script.encode("utf-8"), timeout=timeout)
-    payload = json.loads(raw.decode("utf-8", errors="replace"))
-    if "error" in payload:
-        raise BrowserError("EVAL_FAILED", str(payload["error"]),
-                           retryable="timeout" in str(payload["error"]).lower())
-    value = payload.get("value")
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
-    return value
 
 
 def _scroll_to_load(target: str, *, proxy: str,

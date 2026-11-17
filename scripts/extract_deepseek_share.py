@@ -305,6 +305,36 @@ def _safe(name):
     return (re.sub(r'[\\/:*?"<>|]+', "_", name or "").strip() or "unnamed")
 
 
+def _sequenced_name(node_id, seq, name):
+    """
+    落盘文件名：`n<node>_<全局序号>_<原名>`。
+
+    为什么必须加**全局序号**（一次真实事故）：
+        同一个 node 下可以出现**同名附件**（实测 n43 下两个
+        `frame_0.5s.png`，1,524,055 vs 1,503,421 字节）。旧实现按
+        `file_name` 落盘，第二个**静默覆盖**第一个——清单里记的 sha256
+        和盘上的文件对不上，而且**不报错**。
+        只按 node_id 前缀命名**仍然会撞**（同 node 同名），所以必须再加全局序号。
+    """
+    raw = "n%s_%02d_%s" % (node_id, seq, name)
+    return _safe(raw)
+
+
+# 文档类扩展名：这些**无论 ty 取什么值都返回 400**（实测 p/t/d/f 全 400），
+# 图片（is_image=true）才走 &ty=p 能下。所以要**先分类再决定要不要下**，
+# 而不是对文档也发一堆注定 400 的请求。
+DOCUMENT_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                 ".txt", ".md", ".csv", ".json", ".zip", ".rar", ".7z")
+
+
+def _is_document(f):
+    """判断一个附件是不是文档类（拿不到字节）。"""
+    if f.get("is_image") is True:
+        return False
+    name = (f.get("file_name") or "").lower()
+    return name.endswith(DOCUMENT_EXTS)
+
+
 def download_attachments(biz, outdir, want_thumbnail=True, download=True):
     """
     下载附件**二进制**并返回清单。
@@ -316,6 +346,11 @@ def download_attachments(biz, outdir, want_thumbnail=True, download=True):
         https://files.deepseeksvc.com/api<signed_path>&ty=p   原图
         https://files.deepseeksvc.com/api<signed_path>&ty=t   缩略图
 
+    ⚠️ **文档类附件拿不到字节**（实测：对文档无论 `ty=p/t/d/f` 都返回 400，
+    带登录态也一样）。所以这里**先分类**：文档直接标
+    `bytes_available=False` + 明确的「需手动下载」说明，**不发注定失败的请求**，
+    也不静默失败。图片才走下载。
+
     download=False 时**只收集元数据不下载**（只读模式用：清单仍要如实
     报出附件数量，不能因为没下载就写成 0 个）。
     """
@@ -324,6 +359,7 @@ def download_attachments(biz, outdir, want_thumbnail=True, download=True):
     if att_dir:
         os.makedirs(att_dir, exist_ok=True)
 
+    seq = 0  # 全局序号：防同名覆盖
     for node_id, msg, frag in iter_fragments(biz):
         if frag.get("type") != "FILE":
             continue
@@ -334,6 +370,7 @@ def download_attachments(biz, outdir, want_thumbnail=True, download=True):
                 break
         for f in frag.get("files") or []:
             signed = f.get("signed_path")
+            seq += 1
             base = {
                 "file_id": f.get("id") or f.get("file_id"),
                 "file_name": f.get("file_name"),
@@ -348,7 +385,19 @@ def download_attachments(biz, outdir, want_thumbnail=True, download=True):
                 #   bytes_available_in_export: 账号导出包里永远拿不到字节
                 #   bytes_available:             本路径已下载到字节
                 "bytes_available_in_export": False,
+                "is_image": f.get("is_image"),
             }
+            if _is_document(f):
+                # 文档类：明确报「需手动下载」，不发注定 400 的请求
+                base.update(
+                    bytes_available=False, local_path=None,
+                    bytes_available_reason="document-not-downloadable",
+                    error=("文档类附件无法通过 files.deepseeksvc.com 取字节"
+                           "（实测 ty=p/t/d/f 全 400，带登录态也一样）；"
+                           "需在 DeepSeek 网页端手动下载。"),
+                )
+                items.append(base)
+                continue
             if not signed or not download:
                 base.update(bytes_available=False, local_path=None,
                             error=("no signed_path in share payload" if not signed
@@ -365,7 +414,8 @@ def download_attachments(biz, outdir, want_thumbnail=True, download=True):
             got = []
             for ty, suffix, variant in variants:
                 url = FILE_HOST + signed + ("&" if "?" in signed else "?") + "ty=" + ty
-                fname = stem + suffix + ext
+                # ⚠️ 文件名带 node + 全局序号：同 node 同名附件不再互相覆盖
+                fname = _sequenced_name(node_id, seq, stem + suffix + ext)
                 rel = ("附件/" + fname) if att_dir else None
                 dest = os.path.join(att_dir, fname) if att_dir else None
                 try:
@@ -396,6 +446,20 @@ def download_attachments(biz, outdir, want_thumbnail=True, download=True):
                 "downloaded_bytes": (primary or {}).get("bytes"),
                 "variants": got,
             })
+            # ⚠️ **声明字节数 vs 实到字节数**：CDN 可能重编码（实到偏小是正常的），
+            # 但**实到明显偏小**往往意味着下载被截断/被拦。如实记下来，
+            # 别让「文件存在」冒充「文件完整」。
+            declared = f.get("file_size")
+            actual = (primary or {}).get("bytes")
+            if declared and actual is not None:
+                ratio = actual / float(declared) if declared else None
+                base["size_matches_declared"] = (actual == declared)
+                base["size_ratio"] = round(ratio, 4) if ratio is not None else None
+                if ratio is not None and ratio < 0.5:
+                    base["size_warning"] = (
+                        "实到字节仅为声明值的 %.1f%%（声明 %d，实到 %d）——"
+                        "疑似下载被截断或被拦，请复核。"
+                        % (ratio * 100, declared, actual))
             items.append(base)
     items.sort(key=lambda x: x.get("timestamp") or "")
     return items

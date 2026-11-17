@@ -31,6 +31,7 @@ from extract_codex import extract as extract_codex_file
 from extract_claude import extract as extract_claude
 import extract_deepseek
 import extract_deepseek_share
+import deepseek_private
 import merge_deepseek
 import t3code
 import scan_codex
@@ -745,6 +746,100 @@ def attachment_manifest(meta, conv):
     }
 
 
+def run_deepseek_private_extract(share, out, outdir, reason, markdown, verify,
+                                 as_shape="rescued", proxy=None,
+                                 browser_context_id=None, as_json=False):
+    """
+    DeepSeek **登录态私密会话**（`/a/chat/s/<uuid>`）打捞。
+
+    与另两条路径的关系：
+      - 导出包：能拿到全部会话，但拿不到附件字节。
+      - 分享链接：能拿附件字节，但只有**分享那一刻的快照**。
+      - 私密会话：拿到**完整树**（含所有分叉）+ 最新状态，但需要登录态。
+
+    登录态 token 只在内存里用于 Authorization 头，**不落盘、不进产物**。
+    """
+    sid = deepseek_private.session_id_from_url(share) or share
+    try:
+        # ⚠️ `browser_context_id` 必须真的传下去：忽略它会让抓取落到
+        # **默认上下文**（可能是没登录的那个 profile），失败信息却是
+        # 「localStorage 里没有 userToken——多半是未登录」——
+        # 对真正的故障（上下文选错）给出误导性诊断。
+        biz, _target = deepseek_private.fetch_private(
+            sid, proxy=proxy or "http://localhost:3456",
+            browser_context_id=browser_context_id)
+        result = deepseek_private.adapt(biz, reason=reason, session_id=sid)
+    except deepseek_private.PrivateSessionError as e:
+        print(f"ERROR: 私密会话抓取失败: {e}")
+        sys.exit(2)
+    except Exception as e:  # noqa: BLE001 — 代理/解析异常都要给出可读原因
+        print(f"ERROR: 私密会话抓取失败: {type(e).__name__}: {e}")
+        sys.exit(2)
+
+    meta = result.get("_meta", {})
+    convs = result.get("conversations", [])
+
+    if outdir:
+        outdir = os.path.abspath(outdir)
+        os.makedirs(outdir, exist_ok=True)
+        for c in convs:
+            base = extract_deepseek.safe_filename(c)
+            jp = os.path.join(outdir, base + ".json")
+            _write_json(jp, {"_meta": meta, "conversations": [c]})
+            print(f"wrote {jp}")
+            if as_shape == "openai":
+                _write_openai_variant(meta, [c],
+                                      os.path.join(outdir, base + ".openai.json"),
+                                      title=None)
+            if c.get("attachments"):
+                ap_ = os.path.join(outdir, base + "_attachments.json")
+                _write_json(ap_, attachment_manifest(meta, c))
+                print(f"wrote {ap_}")
+            if markdown:
+                mp = os.path.join(outdir, base + ".md")
+                extract_deepseek.write_markdown(mp, c)
+                print(f"wrote {mp}")
+    else:
+        out_path = os.path.abspath(out or "rescued_deepseek_private.json")
+        out_dir = os.path.dirname(out_path)
+        if out_dir and not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        _write_json(out_path, result)
+        print(f"wrote {out_path}")
+        if as_shape == "openai":
+            _write_openai_variant(meta, convs,
+                                  _openai_variant_path(out_path), title=None)
+
+    # ⚠️ `--json` 必须真的生效：别的平台在 --json 下只吐 JSON，
+    # 这里若照旧打印人读摘要，脚本调用方拿到的 stdout 就不是纯 JSON 了。
+    if not as_json:
+        print_deepseek_summary(result)
+
+    if verify:
+        ok_all = meta.get("verification", {}).get("ok", False)
+        if as_json:
+            print(json.dumps({"verification": meta.get("verification", {}),
+                              "ok": ok_all}, ensure_ascii=False, indent=2))
+        else:
+            print("=" * 60)
+            print("VERIFY (多重集比较: transcript vs 私密会话原始消息)")
+            for c in convs:
+                v = meta.get("verification", {})
+                print(f"  {str(c.get('id'))[:8]} | {c.get('title')} | "
+                      f"{'PASS' if v.get('ok') else 'FAIL'}")
+                for k in ("ok", "seq_contiguous", "raw_mapping_identical"):
+                    print(f"      {'OK ' if v.get(k) else 'BAD'} {k}")
+                print(f"      source={v.get('source_fragment_count')} "
+                      f"output={v.get('output_fragment_count')} "
+                      f"missing={v.get('missing_count')} duplicate={v.get('duplicate_count')}")
+                print(f"      main_path={v.get('main_path_message_count')} "
+                      f"off_path={v.get('off_path_message_count')}")
+            print("=" * 60)
+            print("VERIFY RESULT:", "PASS" if ok_all else "FAIL")
+        if not ok_all:
+            sys.exit(3)
+
+
 def run_deepseek_share_extract(share, title, out, outdir, reason, markdown, verify,
                                as_shape="rescued"):
     """
@@ -944,6 +1039,7 @@ USAGE = """Usage:
   python session_extract.py --platform t3 --session <t3-context-uri> --out <product.json>
   python session_extract.py --platform deepseek <conversations.json> --ids <id>[,<id>] [--out <out.json> | --outdir <dir>]
   python session_extract.py --platform deepseek-share <share_id|share_url> [--out <out.json> | --outdir <dir>]
+  python session_extract.py --platform deepseek-private <session_url|uuid> [--out <out.json> | --outdir <dir>] [--proxy <url>]
   python session_extract.py --platform chatgpt-share <share_url> [--out <out.json> | --outdir <dir>]
   python session_extract.py --platform chatgpt <conversation_url> [--out <out.json> | --outdir <dir>] [--proxy <url>] [--browser-context <id>]
   python session_extract.py --merge <export-product.json> --merge-with <share-product.json> [--outdir <dir>]
@@ -1229,6 +1325,19 @@ def main(argv=None, entry_mode="read"):
             filepath, title, out, outdir, reason, markdown, verify,
             as_shape=as_shape
         ))
+
+    # --- DeepSeek 登录态私密会话分支（第三种容器） ---
+    # `/a/chat/s/<uuid>` 既不是导出包也不是分享链接，必须排在 isfile 检查之前。
+    if platform == "deepseek-private" or (
+            platform is None and deepseek_private.is_private_session_url(filepath or "")):
+        if handoff_mode and not (out or outdir):
+            print("ERROR: handoff requires an explicit --out or --outdir",
+                  file=sys.stderr)
+            return 2
+        sys.exit(run_deepseek_private_extract(
+            filepath, out, outdir, reason, markdown, verify,
+            as_shape=as_shape, proxy=chatgpt_proxy,
+            browser_context_id=browser_context_id, as_json=as_json))
 
     # --- ChatGPT share / authenticated conversation (browser DOM path) ---
     if platform in ("chatgpt", "chatgpt-share", "chatgpt-web"):
